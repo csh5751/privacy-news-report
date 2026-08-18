@@ -1,0 +1,199 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="개인정보 보호와 AI 보안 관련 최신 뉴스 모음">
+  <meta name="color-scheme" content="light dark">
+  <title>개인정보 보호 · AI 보안 뉴스</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      --bg: #f4f7fb; --surface: #ffffff; --text: #172033; --muted: #64748b;
+      --line: #dce4ef; --accent: #2563eb; --accent-soft: #eaf1ff;
+      --shadow: 0 10px 28px rgba(30, 64, 175, .08);
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: var(--bg); color: var(--text); font-family: Pretendard, "Noto Sans KR", system-ui, sans-serif; line-height: 1.65; }
+    .wrap { width: min(1120px, calc(100% - 32px)); margin: 0 auto; }
+    header { padding: 64px 0 38px; background: linear-gradient(135deg, #172554, #1d4ed8 65%, #0ea5e9); color: white; }
+    header h1 { margin: 0 0 12px; font-size: clamp(1.8rem, 5vw, 3rem); line-height: 1.2; letter-spacing: -.04em; }
+    header p { margin: 0; color: #dbeafe; }
+    .stats { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 22px; }
+    .badge { padding: 7px 12px; border: 1px solid rgba(255,255,255,.25); border-radius: 999px; background: rgba(255,255,255,.12); font-size: .9rem; }
+    main { padding: 28px 0 56px; }
+    .topic { margin-bottom: 18px; overflow: hidden; border: 1px solid var(--line); border-radius: 18px; background: var(--surface); box-shadow: var(--shadow); }
+    .topic > summary { display: flex; justify-content: space-between; align-items: center; gap: 16px; padding: 19px 22px; cursor: pointer; color: var(--accent); font-size: 1.18rem; font-weight: 800; list-style: none; }
+    .topic > summary::-webkit-details-marker { display: none; }
+    .topic > summary::before { content: "▸"; transition: transform .15s ease; }
+    .topic[open] > summary::before { transform: rotate(90deg); }
+    .topic > summary > span:first-of-type { margin-right: auto; }
+    .count { padding: 3px 9px; border-radius: 999px; background: var(--accent-soft); font-size: .78rem; }
+    .articles { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); border-top: 1px solid var(--line); }
+    .article { min-width: 0; padding: 22px; border-bottom: 1px solid var(--line); }
+    .article:nth-child(odd) { border-right: 1px solid var(--line); }
+    .article h3 { margin: 0 0 8px; font-size: 1.04rem; line-height: 1.45; }
+    .article h3 a { color: var(--text); text-decoration: none; }
+    .article h3 a:hover, .article-link:hover { color: var(--accent); text-decoration: underline; }
+    .meta { margin: 0 0 10px; color: var(--muted); font-size: .82rem; }
+    .summary { margin: 0 0 13px; color: var(--text); font-size: .92rem; }
+    .article-link { color: var(--accent); font-size: .86rem; font-weight: 700; text-decoration: none; }
+    .empty { padding: 24px; color: var(--muted); }
+    footer { padding: 24px 0 42px; color: var(--muted); text-align: center; font-size: .82rem; }
+    @media (max-width: 720px) {
+      header { padding-top: 44px; } .wrap { width: min(100% - 20px, 1120px); }
+      .articles { grid-template-columns: 1fr; } .article:nth-child(odd) { border-right: 0; }
+      .topic > summary, .article { padding: 17px; }
+    }
+    @media (prefers-color-scheme: dark) {
+      :root { --bg: #0b1220; --surface: #111b2e; --text: #e5edf8; --muted: #94a3b8; --line: #24324a; --accent: #7db2ff; --accent-soft: #172b4d; --shadow: none; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="wrap">
+      <h1>개인정보 보호 · AI 보안 뉴스</h1>
+      <p>주요 개인정보 보호 정책과 보안 이슈를 한곳에서 확인하세요.</p>
+      <div class="stats">
+        <span class="badge">주제 5개</span>
+        <span class="badge">기사 15건</span>
+        <span class="badge">업데이트 2026년 08월 18일 11:12 KST</span>
+      </div>
+    </div>
+  </header>
+  <main class="wrap">
+    <details class="topic" open>
+      <summary>
+        <span>개인정보보호위원회</span>
+        <span class="count">3건</span>
+      </summary>
+      <div class="articles">
+      <article class="article">
+        <h3><a href="https://www.msn.com/ko-kr/news/other/%EC%95%A0%EA%BF%8E%EC%9D%80-%ED%95%B4%EC%BB%A4-%ED%83%93%ED%95%98%EB%8D%94%EB%8B%88-%EA%B3%B5%EA%B3%B5%EA%B8%B0%EA%B4%80-%EC%A0%95%EB%B3%B4%EC%9C%A0%EC%B6%9C-67-%EB%8A%94-%EB%82%B4%EB%B6%80%EC%8B%A4%EC%88%98/ar-AA2aeZ52" target="_blank" rel="noopener noreferrer">“애꿎은 해커 탓하더니”…공공기관 정보유출 67%는 내부실수</a></h3>
+        <p class="meta">매일경제 on MSN<span aria-hidden="true"> · </span>2026-08-17 01:08 KST</p>
+        <p class="summary">5년간 처분완료한 유출사고 139건 94건 업무과실…해킹 44건 웃돌아 [연합뉴스] 공공기관에서 발생한 개인정보 유출 사고가 최근 5년 새 크게 증가한 가운데, 3건 중 2건은 외부 해킹이 아닌 ‘업무과실’에서 비롯된 것으로 나타났다. 16일 국회 정무위원회 소속 송언석 국민의힘 의원이 개인정보보호위원회에서 제출받은 ‘공공기관 개인정보 유출 사고 현황’에 ...</p>
+        <a class="article-link" href="https://www.msn.com/ko-kr/news/other/%EC%95%A0%EA%BF%8E%EC%9D%80-%ED%95%B4%EC%BB%A4-%ED%83%93%ED%95%98%EB%8D%94%EB%8B%88-%EA%B3%B5%EA%B3%B5%EA%B8%B0%EA%B4%80-%EC%A0%95%EB%B3%B4%EC%9C%A0%EC%B6%9C-67-%EB%8A%94-%EB%82%B4%EB%B6%80%EC%8B%A4%EC%88%98/ar-AA2aeZ52" target="_blank" rel="noopener noreferrer">원문 보기 <span aria-hidden="true">→</span></a>
+      </article>
+      <article class="article">
+        <h3><a href="https://www.mk.co.kr/news/it/12129075" target="_blank" rel="noopener noreferrer">공공기관 개인정보 유출 … 3건 중 2건은 &#x27;업무과실&#x27;</a></h3>
+        <p class="meta">매일경제<span aria-hidden="true"> · </span>2026-08-16 19:51 KST</p>
+        <p class="summary">공공기관에서 발생한 개인정보 유출 사고가 최근 5년 새 크게 증가한 가운데, 3건 중 2건은 외부 해킹이 아닌 &#x27;업무과실&#x27;에서 비롯된 것으로 나타났다. 16일 국회 정무위원회 소속 송언석 국민의힘 의원이 개인정보보호위원회에서 제출받은 &#x27;공공기관 개인정보 유출 사고 현황&#x27;에 따르면 올해 들어 6월까지 164건의 개인정보 유출 사고가 발생해 이미 지난해 연간 ...</p>
+        <a class="article-link" href="https://www.mk.co.kr/news/it/12129075" target="_blank" rel="noopener noreferrer">원문 보기 <span aria-hidden="true">→</span></a>
+      </article>
+      <article class="article">
+        <h3><a href="https://www.msn.com/ko-kr/news/other/3%EA%B1%B4-%EC%A4%91-2%EA%B1%B4%EC%9D%80-%ED%95%B4%ED%82%B9-%EC%95%84%EB%8B%8C-%EC%97%85%EB%AC%B4%EA%B3%BC%EC%8B%A4-%EA%B3%B5%EA%B3%B5%EA%B8%B0%EA%B4%80-%EC%A0%95%EB%B3%B4-%EC%9C%A0%EC%B6%9C%ED%94%BC%ED%95%B4-%EA%B8%89%EC%A6%9D/ar-AA2acUYx" target="_blank" rel="noopener noreferrer">3건 중 2건은 해킹 아닌 &#x27;업무과실&#x27;… 공공기관 정보 유출피해 급증</a></h3>
+        <p class="meta">대전일보 on MSN<span aria-hidden="true"> · </span>2026-08-16 13:35 KST</p>
+        <p class="summary">공공기관에서 발생한 개인정보 유출 사고가 최근 5년 사이 급증한 것으로 나타났다. 특히 처분이 끝난 유출 사고 3건 중 2건 이상이 해킹 등 외부 공격이 아닌 내부 업무과실로 발생한 것으로 조사됐다.16일 국회 정무위원회 소속 송언석 국민의힘 의원이 개인정보보호위원회에서 제출받은 자료에 따르면 지난해 기준 개인정보 유출이 발생한 공공기관 수는 128곳으로 ...</p>
+        <a class="article-link" href="https://www.msn.com/ko-kr/news/other/3%EA%B1%B4-%EC%A4%91-2%EA%B1%B4%EC%9D%80-%ED%95%B4%ED%82%B9-%EC%95%84%EB%8B%8C-%EC%97%85%EB%AC%B4%EA%B3%BC%EC%8B%A4-%EA%B3%B5%EA%B3%B5%EA%B8%B0%EA%B4%80-%EC%A0%95%EB%B3%B4-%EC%9C%A0%EC%B6%9C%ED%94%BC%ED%95%B4-%EA%B8%89%EC%A6%9D/ar-AA2acUYx" target="_blank" rel="noopener noreferrer">원문 보기 <span aria-hidden="true">→</span></a>
+      </article>
+      </div>
+    </details>
+    <details class="topic" open>
+      <summary>
+        <span>개인정보 유출 사고</span>
+        <span class="count">3건</span>
+      </summary>
+      <div class="articles">
+      <article class="article">
+        <h3><a href="https://www.msn.com/ko-kr/%EA%B3%B5%EA%B3%B5-%EC%95%88%EC%A0%84-%EB%B0%8F-%EB%B9%84%EC%83%81-%EC%82%AC%ED%83%9C/%EC%9D%BC%EB%B0%98/%EB%8B%A8%EB%8F%85-%EA%B0%9C%EC%9D%B8%EC%A0%95%EB%B3%B4-18%EB%A7%8C%EA%B1%B4-%ED%84%B8%EB%A6%B0-%EC%84%9C%EA%B0%95%EB%8C%80-%ED%95%99%EC%A0%90%EA%B5%90%EB%A5%98-%ED%83%80%EB%8C%80%EC%83%9D%EB%8F%84-%EC%9C%A0%EC%B6%9C/ar-AA2ahqxQ" target="_blank" rel="noopener noreferrer">[단독] ‘개인정보 18만건’ 털린 서강대, 학점교류 타대생도 유출</a></h3>
+        <p class="meta">세계일보 on MSN<span aria-hidden="true"> · </span>2026-08-17 11:10 KST</p>
+        <p class="summary">서강대 홈페이지 서버와 로그인 시스템이 해킹돼 개교 이래 등록된 모든 졸업생과 재학생의 휴대전화 번호 등 개인정보 약 18만건이 유출돼 논란인 가운데 서강대 학생뿐 아니라 학점교류 이력이 있는 타 학교 학생들까지 피해를 입은 것으로 확인됐다. 17일 취재를 종합하면 서강대는 전날 서강대 재학생·졸업생·교직원뿐 아니라 과거 서강대에서 학점교류를 한 적 있던 ...</p>
+        <a class="article-link" href="https://www.msn.com/ko-kr/%EA%B3%B5%EA%B3%B5-%EC%95%88%EC%A0%84-%EB%B0%8F-%EB%B9%84%EC%83%81-%EC%82%AC%ED%83%9C/%EC%9D%BC%EB%B0%98/%EB%8B%A8%EB%8F%85-%EA%B0%9C%EC%9D%B8%EC%A0%95%EB%B3%B4-18%EB%A7%8C%EA%B1%B4-%ED%84%B8%EB%A6%B0-%EC%84%9C%EA%B0%95%EB%8C%80-%ED%95%99%EC%A0%90%EA%B5%90%EB%A5%98-%ED%83%80%EB%8C%80%EC%83%9D%EB%8F%84-%EC%9C%A0%EC%B6%9C/ar-AA2ahqxQ" target="_blank" rel="noopener noreferrer">원문 보기 <span aria-hidden="true">→</span></a>
+      </article>
+      <article class="article">
+        <h3><a href="https://www.msn.com/ko-kr/news/news/%ED%95%B4%EC%BB%A4-%ED%83%93%ED%96%88%EB%8A%94%EB%8D%B0-%EA%B3%B5%EA%B3%B5%EA%B8%B0%EA%B4%80-%EA%B0%9C%EC%9D%B8%EC%A0%95%EB%B3%B4-%EC%9C%A0%EC%B6%9C-3%EA%B1%B4-%EC%A4%91-2%EA%B1%B4%EC%9D%B4-%EC%97%85%EB%AC%B4%EA%B3%BC%EC%8B%A4/ar-AA2agxon" target="_blank" rel="noopener noreferrer">해커 탓했는데... 공공기관 개인정보 유출, 3건 중 2건이 업무과실</a></h3>
+        <p class="meta">인사이트 on MSN<span aria-hidden="true"> · </span>2026-08-17 06:30 KST</p>
+        <p class="summary">최근 5년간 공공기관 개인정보 유출 사고가 7배 증가했고, 사고 3건 중 2건 이상이 해킹이 아닌 업무과실로 발생해 내부 보안체계 전면 점검이 필요하다는 지적이 나왔다.</p>
+        <a class="article-link" href="https://www.msn.com/ko-kr/news/news/%ED%95%B4%EC%BB%A4-%ED%83%93%ED%96%88%EB%8A%94%EB%8D%B0-%EA%B3%B5%EA%B3%B5%EA%B8%B0%EA%B4%80-%EA%B0%9C%EC%9D%B8%EC%A0%95%EB%B3%B4-%EC%9C%A0%EC%B6%9C-3%EA%B1%B4-%EC%A4%91-2%EA%B1%B4%EC%9D%B4-%EC%97%85%EB%AC%B4%EA%B3%BC%EC%8B%A4/ar-AA2agxon" target="_blank" rel="noopener noreferrer">원문 보기 <span aria-hidden="true">→</span></a>
+      </article>
+      <article class="article">
+        <h3><a href="https://www.msn.com/ko-kr/news/other/%EC%95%A0%EA%BF%8E%EC%9D%80-%ED%95%B4%EC%BB%A4-%ED%83%93%ED%95%98%EB%8D%94%EB%8B%88-%EA%B3%B5%EA%B3%B5%EA%B8%B0%EA%B4%80-%EC%A0%95%EB%B3%B4%EC%9C%A0%EC%B6%9C-67-%EB%8A%94-%EB%82%B4%EB%B6%80%EC%8B%A4%EC%88%98/ar-AA2aeZ52" target="_blank" rel="noopener noreferrer">“애꿎은 해커 탓하더니”…공공기관 정보유출 67%는 내부실수</a></h3>
+        <p class="meta">매일경제 on MSN<span aria-hidden="true"> · </span>2026-08-17 01:08 KST</p>
+        <p class="summary">5년간 처분완료한 유출사고 139건 94건 업무과실…해킹 44건 웃돌아 [연합뉴스] 공공기관에서 발생한 개인정보 유출 사고가 최근 5년 새 크게 증가한 가운데, 3건 중 2건은 외부 해킹이 아닌 ‘업무과실’에서 비롯된 것으로 나타났다. 16일 국회 정무위원회 소속 송언석 국민의힘 의원이 개인정보보호위원회에서 제출받은 ‘공공기관 개인정보 유출 사고 현황’에 ...</p>
+        <a class="article-link" href="https://www.msn.com/ko-kr/news/other/%EC%95%A0%EA%BF%8E%EC%9D%80-%ED%95%B4%EC%BB%A4-%ED%83%93%ED%95%98%EB%8D%94%EB%8B%88-%EA%B3%B5%EA%B3%B5%EA%B8%B0%EA%B4%80-%EC%A0%95%EB%B3%B4%EC%9C%A0%EC%B6%9C-67-%EB%8A%94-%EB%82%B4%EB%B6%80%EC%8B%A4%EC%88%98/ar-AA2aeZ52" target="_blank" rel="noopener noreferrer">원문 보기 <span aria-hidden="true">→</span></a>
+      </article>
+      </div>
+    </details>
+    <details class="topic" open>
+      <summary>
+        <span>개보위</span>
+        <span class="count">3건</span>
+      </summary>
+      <div class="articles">
+      <article class="article">
+        <h3><a href="https://www.fnnews.com/news/202608141523213206" target="_blank" rel="noopener noreferrer">대법원, 가족관계증명서 &#x27;스크래핑&#x27; 차단 일단 유예…은행권 급한 불 껐다</a></h3>
+        <p class="meta">파이낸셜뉴스<span aria-hidden="true"> · </span>2026-08-14 17:24 KST</p>
+        <p class="summary">(서울=뉴스1) 윤수희 기자 = 대법원이 가족관계등록시스템에서 가족관계증명서 등을 자동으로 가져오는 &#x27;스크래핑&#x27;을 차단하기로 했다가 금융권의 반발이 커지자 시행을 한시적으로 유예했다. 비대면 대출 등에 광범위하게 활용돼 온 스크래핑이 갑자기 막힐 경우 금융..</p>
+        <a class="article-link" href="https://www.fnnews.com/news/202608141523213206" target="_blank" rel="noopener noreferrer">원문 보기 <span aria-hidden="true">→</span></a>
+      </article>
+      <article class="article">
+        <h3><a href="https://www.msn.com/ko-kr/money/other/%EB%8B%A8%EB%8F%85-%EA%B8%88%EC%9C%B5%EC%9C%84-%EA%B0%9C%EB%B3%B4%EC%9C%84-%EC%84%B8%EC%A2%85%E8%A1%8C-%EC%82%B0%EC%9D%80-%EA%B8%B0%EC%9D%80-%EC%88%98%EC%9D%80%EB%8F%84-%EC%A7%80%EB%B0%A9-%EC%9D%B4%EC%A0%84-%EC%9C%A0%EB%A0%A5/ar-AA2a08qL" target="_blank" rel="noopener noreferrer">[단독] 금융위·개보위 세종行…산은·기은·수은도 지방 이전 유력</a></h3>
+        <p class="meta">뉴스1 on MSN<span aria-hidden="true"> · </span>2026-08-13 07:42 KST</p>
+        <p class="summary">정부, 이르면 25일 중앙행정기관·2차 공공기관 이전계획 발표산은·기은 이전 지역·방식은 미정…금감원도 지방 이전 가능성 (서울·세종=뉴스1) 이강 김근욱 한병찬 임윤지 기자 = 중앙부처와 공공기관의 지방 이전을 추진 중인 정부가 금융위원회와 개인정보보호위원회의 세종 이전을 사실상 확정한 것으로 확인됐다. 산업은행과 ...</p>
+        <a class="article-link" href="https://www.msn.com/ko-kr/money/other/%EB%8B%A8%EB%8F%85-%EA%B8%88%EC%9C%B5%EC%9C%84-%EA%B0%9C%EB%B3%B4%EC%9C%84-%EC%84%B8%EC%A2%85%E8%A1%8C-%EC%82%B0%EC%9D%80-%EA%B8%B0%EC%9D%80-%EC%88%98%EC%9D%80%EB%8F%84-%EC%A7%80%EB%B0%A9-%EC%9D%B4%EC%A0%84-%EC%9C%A0%EB%A0%A5/ar-AA2a08qL" target="_blank" rel="noopener noreferrer">원문 보기 <span aria-hidden="true">→</span></a>
+      </article>
+      <article class="article">
+        <h3><a href="https://www.msn.com/ko-kr/money/%EA%B8%B0%EC%88%A0/%EC%8A%A4%ED%81%AC%EB%A0%88%EC%9D%B4%ED%95%91-%EC%A0%9C%ED%95%9C%EC%97%90-%EA%B8%88%EC%9C%B5%EA%B6%8C-%EB%B6%80%EA%B8%80-%EA%B0%9C%EB%B3%B4%EC%9C%84-%EC%82%AC%EC%A0%84%ED%98%91%EC%9D%98-%EC%8B%A0%EC%B2%AD%ED%95%98%EB%A9%B4-%ED%95%9C%EC%8B%9C%EC%A0%81-%ED%97%88%EC%9A%A9/ar-AA29QLXR" target="_blank" rel="noopener noreferrer">‘스크레이핑’ 제한에 금융권 부글…개보위 “사전협의 신청하면 한시적 허용”</a></h3>
+        <p class="meta">서울신문 on MSN<span aria-hidden="true"> · </span>2026-08-11 13:02 KST</p>
+        <p class="summary">“서류더미 이고지고 다니란건가” 소득 등 정보 긁어오던 방식 제동 보유기관과 건건이 협의해서 사용 대출카드개설 등 고객 불편 우려 개보위 “개인정보 유출·오남용 방지” “준비 기간 필요하면 단계적 전환”지금은 은행 앱에서 대출을 신청하면서 동의 버튼만 누르면 ...</p>
+        <a class="article-link" href="https://www.msn.com/ko-kr/money/%EA%B8%B0%EC%88%A0/%EC%8A%A4%ED%81%AC%EB%A0%88%EC%9D%B4%ED%95%91-%EC%A0%9C%ED%95%9C%EC%97%90-%EA%B8%88%EC%9C%B5%EA%B6%8C-%EB%B6%80%EA%B8%80-%EA%B0%9C%EB%B3%B4%EC%9C%84-%EC%82%AC%EC%A0%84%ED%98%91%EC%9D%98-%EC%8B%A0%EC%B2%AD%ED%95%98%EB%A9%B4-%ED%95%9C%EC%8B%9C%EC%A0%81-%ED%97%88%EC%9A%A9/ar-AA29QLXR" target="_blank" rel="noopener noreferrer">원문 보기 <span aria-hidden="true">→</span></a>
+      </article>
+      </div>
+    </details>
+    <details class="topic" open>
+      <summary>
+        <span>개인정보보호법</span>
+        <span class="count">3건</span>
+      </summary>
+      <div class="articles">
+      <article class="article">
+        <h3><a href="https://www.hidomin.com/news/articleView.html?idxno=717442" target="_blank" rel="noopener noreferrer">구미시, 개인정보 보호·사이버 위협 대응…정보시스템 담당자 보안교육 실시</a></h3>
+        <p class="meta">경북도민일보<span aria-hidden="true"> · </span>2026-08-17 17:00 KST</p>
+        <p class="summary">구미시 관계자가 지난 13일 시청 3층 대회의실에서 정보시스템 담당자들 대상으로 ‘개별 정보시스템 운영 담당자 교육’을 실시하고 있다. 구미시 제공 구미시가 시민 개인정보 보호와 사이버 위협 대응을 위해 정보시스템 담당자들의 보안 역량 강화에 나섰다. 시는 지난 13일 시청 3층 대회의실에서 115개 정보시스템 담당자 80여명을 대상으로 ‘개별 정보시스템 ...</p>
+        <a class="article-link" href="https://www.hidomin.com/news/articleView.html?idxno=717442" target="_blank" rel="noopener noreferrer">원문 보기 <span aria-hidden="true">→</span></a>
+      </article>
+      <article class="article">
+        <h3><a href="https://www.msn.com/ko-kr/health/%EC%9D%BC%EB%B0%98/%EB%8C%80%ED%95%9C%EC%B2%B4%EC%9C%A1%ED%9A%8C-%EC%9C%A0%EA%B4%80%EA%B8%B0%EA%B4%80-%EA%B0%9C%EC%9D%B8%EC%A0%95%EB%B3%B4-%EB%B3%B4%ED%98%B8-%ED%98%91%EB%A0%A5-%EC%97%85%EB%AC%B4%ED%98%91%EC%95%BD-%EA%B0%B1%EC%8B%A0/ar-AA29ZEoF" target="_blank" rel="noopener noreferrer">대한체육회, 유관기관 개인정보 보호 협력 업무협약 갱신</a></h3>
+        <p class="meta">헤럴드경제 on MSN<span aria-hidden="true"> · </span>2026-08-13 06:49 KST</p>
+        <p class="summary">[헤럴드경제=조용직 기자] 대한체육회(회장 유승민)는 12일 서울 올림픽회관 13층 대회의실에서 서울올림픽기념국민체육진흥공단(이사장 하형주), 대한장애인체육회(회장 정진완)와 함께 ‘개인정보 보호 및 정보보안 협력 강화 업무협약’을 갱신 체결했다고 밝혔다. 이번 협약은 체육 분야 공공기관 간 개인정보 보호 및 정보보안 협력체계를 강화하고, 개인정보 유출·침 ...</p>
+        <a class="article-link" href="https://www.msn.com/ko-kr/health/%EC%9D%BC%EB%B0%98/%EB%8C%80%ED%95%9C%EC%B2%B4%EC%9C%A1%ED%9A%8C-%EC%9C%A0%EA%B4%80%EA%B8%B0%EA%B4%80-%EA%B0%9C%EC%9D%B8%EC%A0%95%EB%B3%B4-%EB%B3%B4%ED%98%B8-%ED%98%91%EB%A0%A5-%EC%97%85%EB%AC%B4%ED%98%91%EC%95%BD-%EA%B0%B1%EC%8B%A0/ar-AA29ZEoF" target="_blank" rel="noopener noreferrer">원문 보기 <span aria-hidden="true">→</span></a>
+      </article>
+      <article class="article">
+        <h3><a href="https://www.msn.com/ko-kr/news/other/%EA%B0%9C%EC%9D%B8%EC%A0%95%EB%B3%B4%EB%B3%B4%ED%98%B8%EC%9C%84%EC%9B%90%ED%9A%8C-%EC%8A%A4%ED%81%AC%EB%9E%98%ED%95%91-%EC%A0%84%EB%A9%B4-%EA%B8%88%EC%A7%80-%EC%95%84%EB%8B%88%EB%8B%A4-%ED%95%9C%EC%8B%9C%EC%A0%81-%EC%9C%A0%EC%98%88/ar-AA29SOza" target="_blank" rel="noopener noreferrer">개인정보보호위원회 &quot;스크래핑, 전면 금지 아니다⋯한시적 유예&quot;</a></h3>
+        <p class="meta">아이뉴스24 on MSN<span aria-hidden="true"> · </span>2026-08-12 06:32 KST</p>
+        <p class="summary">신민필 개인정보보호위원회 범정부 마이데이터 추진단장은 11일 &quot;스크래핑 관행은 과도한 정보 수집, 유출 등 위험이 높다&quot;며 &quot;공공기관의 응용프로그램인터페이스(API)가 즉시 구축되기 어려운 현실을 고려해 스크래핑 전면 금 ...</p>
+        <a class="article-link" href="https://www.msn.com/ko-kr/news/other/%EA%B0%9C%EC%9D%B8%EC%A0%95%EB%B3%B4%EB%B3%B4%ED%98%B8%EC%9C%84%EC%9B%90%ED%9A%8C-%EC%8A%A4%ED%81%AC%EB%9E%98%ED%95%91-%EC%A0%84%EB%A9%B4-%EA%B8%88%EC%A7%80-%EC%95%84%EB%8B%88%EB%8B%A4-%ED%95%9C%EC%8B%9C%EC%A0%81-%EC%9C%A0%EC%98%88/ar-AA29SOza" target="_blank" rel="noopener noreferrer">원문 보기 <span aria-hidden="true">→</span></a>
+      </article>
+      </div>
+    </details>
+    <details class="topic" open>
+      <summary>
+        <span>AI 보안</span>
+        <span class="count">3건</span>
+      </summary>
+      <div class="articles">
+      <article class="article">
+        <h3><a href="https://www.mt.co.kr/finance/2026/08/18/2026081809095432410" target="_blank" rel="noopener noreferrer">금융보안원, 금융사 직원 대상 &#x27;AI 해킹방어 대회&#x27; 연다</a></h3>
+        <p class="meta">머니투데이<span aria-hidden="true"> · </span>2026-08-17 22:27 KST</p>
+        <p class="summary">금융보안원이 금융사 직원들을 대상으로 인공지능(AI)을 활용해 사이버 공격에 대응하는 역량을 겨루는 해킹방어 대회를 연다. 금융보안원은 오는 24일부터 &#x27;2026 금융보안 AI 활용 해킹방어 대회 ...</p>
+        <a class="article-link" href="https://www.mt.co.kr/finance/2026/08/18/2026081809095432410" target="_blank" rel="noopener noreferrer">원문 보기 <span aria-hidden="true">→</span></a>
+      </article>
+      <article class="article">
+        <h3><a href="https://www.newspim.com/news/view/20260818000409" target="_blank" rel="noopener noreferrer">&quot;SGA솔루션즈, AI 데이터센터 증설 수혜&quot; - CMIR</a></h3>
+        <p class="meta">뉴스핌<span aria-hidden="true"> · </span>2026-08-17 18:30 KST</p>
+        <p class="summary">[서울=뉴스핌] 이나영 기자= 독립리서치 CMIR은 18일 SGA솔루션즈에 대해 인공지능(AI) 데이터센터 증설에 따라 서버와 클라우드·계정 등 보안 수요가 확대되면서 성장 기회가 커질 것으로 분석했다. SGA솔루션즈는 서버 운영체제(OS ...</p>
+        <a class="article-link" href="https://www.newspim.com/news/view/20260818000409" target="_blank" rel="noopener noreferrer">원문 보기 <span aria-hidden="true">→</span></a>
+      </article>
+      <article class="article">
+        <h3><a href="https://www.msn.com/ko-kr/news/techandscience/ai%EB%A1%9C-%EA%B5%AC%ED%98%84%ED%95%98%EB%8A%94-%EC%9E%90%EC%9C%A8-%EB%B3%B4%EC%95%88-%EC%8B%9C%EB%8C%80-k-%EB%B3%B4%EC%95%88-%ED%98%84%EC%A3%BC%EC%86%8C-%ED%95%9C%EB%88%88%EC%97%90-isec-2026/ar-AA29Zvp9" target="_blank" rel="noopener noreferrer">AI로 구현하는 자율 보안 시대, K-보안 현주소 한눈에 [ISEC 2026]</a></h3>
+        <p class="meta">IT동아 on MSN<span aria-hidden="true"> · </span>2026-08-13 04:35 KST</p>
+        <p class="summary">[IT동아 김예지 기자] AI가 스스로 취약점을 탐색하고 공격 기법을 진화시키면서, 이를 방어하는 사이버 보안 역량 역시 새로운 전환점을 맞이했다. 8월 11일과 12일 서울 코엑스에서 열린 ‘제20회 국제 시큐리티 컨퍼런스(ISEC 2026)’도 ‘AI로 구현하는 자율 보안의 미래’를 주제로 열려 국내 보안 동향을 조명했다. ISEC 2026 조직위원회가 ...</p>
+        <a class="article-link" href="https://www.msn.com/ko-kr/news/techandscience/ai%EB%A1%9C-%EA%B5%AC%ED%98%84%ED%95%98%EB%8A%94-%EC%9E%90%EC%9C%A8-%EB%B3%B4%EC%95%88-%EC%8B%9C%EB%8C%80-k-%EB%B3%B4%EC%95%88-%ED%98%84%EC%A3%BC%EC%86%8C-%ED%95%9C%EB%88%88%EC%97%90-isec-2026/ar-AA29Zvp9" target="_blank" rel="noopener noreferrer">원문 보기 <span aria-hidden="true">→</span></a>
+      </article>
+      </div>
+    </details>
+  </main>
+  <footer class="wrap">공개 뉴스 검색 결과를 자동으로 수집한 요약입니다. 정확한 내용은 원문을 확인하세요.</footer>
+</body>
+</html>
