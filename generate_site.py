@@ -139,6 +139,8 @@ def main(argv: list[str] | None = None) -> int:
 
     keywords = app.parse_keywords(args.keywords) or app.DEFAULT_KEYWORDS.copy()
     topics: dict[str, list[app.Article]] = {}
+    claimed_keys: set[str] = set()
+    claimed_articles: list[app.Article] = []
     failures = 0
     for keyword in keywords:
         print(f"[수집] {keyword}")
@@ -146,12 +148,12 @@ def main(argv: list[str] | None = None) -> int:
             articles = app.unique_articles(
                 app.fetch_news(keyword, timeout=args.timeout, max_results=max(args.limit * 3, 10))
             )
-            articles.sort(
-                key=lambda item: item.published
-                or datetime.min.replace(tzinfo=timezone.utc),
-                reverse=True,
+            topics[keyword] = app.select_today_articles(
+                articles,
+                args.limit,
+                claimed_keys=claimed_keys,
+                claimed_articles=claimed_articles,
             )
-            topics[keyword] = articles[: args.limit]
         except RuntimeError as exc:
             failures += 1
             topics[keyword] = []

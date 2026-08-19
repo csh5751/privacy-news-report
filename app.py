@@ -13,7 +13,9 @@ import sys
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from difflib import SequenceMatcher
 from email.utils import parsedate_to_datetime
+from pathlib import Path
 from typing import Iterable
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, urlencode, urlparse
@@ -36,6 +38,21 @@ TAG_RE = re.compile(r"<[^>]+>")
 SPACE_RE = re.compile(r"\s+")
 SENTENCE_RE = re.compile(r"(?<=[.!?。]|[다요죠])\s+")
 TEAMS_MAX_PAYLOAD_BYTES = 25_000
+KST = timezone(timedelta(hours=9))
+HISTORY_RETENTION_DAYS = 30
+STORY_TOKEN_RE = re.compile(r"[가-힣A-Za-z0-9]+")
+STORY_STOPWORDS = {
+    "ai", "개인정보", "개인정보보호", "보호", "관련", "대한", "위한",
+    "시대", "뉴스", "최신", "진행", "개최", "밝혔다", "19일", "18일",
+}
+SOURCE_TIERS = (
+    (100, ("연합뉴스", "kbs", "mbc", "sbs", "jtbc", "ytn")),
+    (95, ("조선일보", "중앙일보", "동아일보", "한겨레", "경향신문", "한국일보")),
+    (90, ("한국경제", "매일경제", "서울경제", "머니투데이", "이데일리")),
+    (85, ("전자신문", "아이뉴스24", "zdnet", "지디넷", "디지털데일리", "보안뉴스")),
+    (75, ("뉴스1", "뉴시스", "이투데이", "아시아투데이")),
+)
+AGGREGATOR_HOSTS = ("msn.com", "news.nate.com", "zum.com")
 
 
 @dataclass(frozen=True)
@@ -331,10 +348,218 @@ def unique_articles(articles: Iterable[Article]) -> list[Article]:
     return result
 
 
+def article_keys(article: Article) -> set[str]:
+    """URL 추적값과 제목 표기 차이를 정리한 중복 판별 키를 만든다."""
+    keys = {f"title:{SPACE_RE.sub(' ', article.title).strip().casefold()}"}
+    try:
+        parsed = urlparse(article.link)
+        query = [
+            (name, value)
+            for name, values in parse_qs(parsed.query, keep_blank_values=True).items()
+            if not name.casefold().startswith("utm_")
+            for value in values
+        ]
+        normalized = parsed._replace(
+            scheme=parsed.scheme.casefold(),
+            netloc=parsed.netloc.casefold(),
+            path=parsed.path.rstrip("/") or "/",
+            query=urlencode(sorted(query)),
+            fragment="",
+        ).geturl()
+        keys.add(f"url:{normalized}")
+    except (TypeError, ValueError):
+        keys.add(f"url:{article.link}")
+    return keys
+
+
+def story_tokens(value: str) -> set[str]:
+    """기사 비교에 쓸 핵심 단어를 추출한다."""
+    return {
+        token.casefold()
+        for token in STORY_TOKEN_RE.findall(clean_text(value))
+        if len(token) >= 2 and token.casefold() not in STORY_STOPWORDS
+    }
+
+
+def same_story(left: Article, right: Article) -> bool:
+    """서로 다른 언론사의 기사가 같은 사건을 다루는지 휴리스틱으로 판단한다."""
+    left_title = story_tokens(left.title)
+    right_title = story_tokens(right.title)
+    shared_title = left_title & right_title
+    smaller_title = min(len(left_title), len(right_title))
+    if smaller_title and len(shared_title) >= 2:
+        if len(shared_title) / smaller_title >= 0.6:
+            return True
+
+    normalized_left = "".join(STORY_TOKEN_RE.findall(left.title)).casefold()
+    normalized_right = "".join(STORY_TOKEN_RE.findall(right.title)).casefold()
+    if SequenceMatcher(None, normalized_left, normalized_right).ratio() >= 0.62:
+        return True
+
+    left_detail = story_tokens(f"{left.title} {left.description}")
+    right_detail = story_tokens(f"{right.title} {right.description}")
+    shared_detail = left_detail & right_detail
+    smaller_detail = min(len(left_detail), len(right_detail))
+    return (
+        smaller_detail >= 4
+        and len(shared_detail) >= 4
+        and len(shared_detail) / smaller_detail >= 0.5
+    )
+
+
+def representative_score(article: Article) -> tuple[int, int, float]:
+    """언론사 신뢰도, 원문성, 정보량, 최신성으로 대표 기사 순위를 정한다."""
+    source = article.source.casefold()
+    credibility = 50
+    for score, names in SOURCE_TIERS:
+        if any(name in source for name in names):
+            credibility = score
+            break
+
+    hostname = (urlparse(article.link).hostname or "").casefold()
+    if any(hostname == host or hostname.endswith(f".{host}") for host in AGGREGATOR_HOSTS):
+        credibility -= 15
+    else:
+        credibility += 10
+
+    information = min(len(clean_text(article.description)), 400)
+    published = article.published or datetime.min.replace(tzinfo=timezone.utc)
+    return credibility, information, published.timestamp()
+
+
+def deduplicate_stories(articles: Iterable[Article]) -> list[Article]:
+    """동일 사건 기사들을 묶고 각 사건에서 가장 신뢰도 높은 대표 기사만 남긴다."""
+    clusters: list[list[Article]] = []
+    for article in articles:
+        for cluster in clusters:
+            if any(same_story(article, existing) for existing in cluster):
+                cluster.append(article)
+                break
+        else:
+            clusters.append([article])
+    return [max(cluster, key=representative_score) for cluster in clusters]
+
+
+def today_start_utc(now: datetime | None = None) -> datetime:
+    """현재 KST 날짜의 시작 시각을 UTC로 반환한다."""
+    current = now or datetime.now(timezone.utc)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=timezone.utc)
+    today = current.astimezone(KST)
+    return today.replace(hour=0, minute=0, second=0, microsecond=0).astimezone(
+        timezone.utc
+    )
+
+
+def select_today_articles(
+    articles: Iterable[Article],
+    limit: int,
+    excluded_keys: set[str] | None = None,
+    claimed_keys: set[str] | None = None,
+    claimed_articles: list[Article] | None = None,
+    now: datetime | None = None,
+) -> list[Article]:
+    """오늘 게시됐고 아직 사용되지 않은 기사만 최신순으로 선택한다."""
+    current = now or datetime.now(timezone.utc)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=timezone.utc)
+    current = current.astimezone(timezone.utc)
+    start = today_start_utc(current)
+    excluded = excluded_keys or set()
+    claimed = claimed_keys if claimed_keys is not None else set()
+    claimed_stories = claimed_articles if claimed_articles is not None else []
+    candidates: list[Article] = []
+    ordered = sorted(
+        articles,
+        key=lambda item: item.published or datetime.min.replace(tzinfo=timezone.utc),
+        reverse=True,
+    )
+    for article in ordered:
+        if article.published is None:
+            continue
+        published = article.published.astimezone(timezone.utc)
+        if published < start or published > current + timedelta(minutes=10):
+            continue
+        keys = article_keys(article)
+        if keys & excluded:
+            continue
+        candidates.append(article)
+
+    representatives = deduplicate_stories(candidates)
+    representatives.sort(
+        key=lambda item: item.published or datetime.min.replace(tzinfo=timezone.utc),
+        reverse=True,
+    )
+    selected: list[Article] = []
+    for article in representatives:
+        keys = article_keys(article)
+        if keys & claimed or any(same_story(article, used) for used in claimed_stories):
+            continue
+        selected.append(article)
+        for candidate in candidates:
+            if same_story(article, candidate):
+                claimed.update(article_keys(candidate))
+        claimed_stories.append(article)
+        if len(selected) >= limit:
+            break
+    return selected
+
+
+def history_path() -> Path:
+    """전송 이력을 저장할 사용자별 로컬 파일 경로를 반환한다."""
+    base = os.environ.get("LOCALAPPDATA")
+    root = Path(base) if base else Path.home() / ".local" / "share"
+    return root / "PrivacyNewsReport" / "sent_articles.json"
+
+
+def load_sent_history(path: Path | None = None) -> dict[str, str]:
+    """최근 전송 이력을 읽고 보관 기간이 지난 항목을 제외한다."""
+    target = path or history_path()
+    try:
+        payload = json.loads(target.read_text(encoding="utf-8"))
+        records = payload.get("sent", {})
+        if not isinstance(records, dict):
+            return {}
+    except (FileNotFoundError, OSError, json.JSONDecodeError, UnicodeDecodeError):
+        return {}
+
+    cutoff = datetime.now(timezone.utc) - timedelta(days=HISTORY_RETENTION_DAYS)
+    retained: dict[str, str] = {}
+    for key, value in records.items():
+        if not isinstance(key, str) or not isinstance(value, str):
+            continue
+        try:
+            recorded_at = datetime.fromisoformat(value)
+            if recorded_at.tzinfo is None:
+                recorded_at = recorded_at.replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+        if recorded_at.astimezone(timezone.utc) >= cutoff:
+            retained[key] = value
+    return retained
+
+
+def save_sent_history(
+    records: dict[str, str], new_keys: set[str], path: Path | None = None
+) -> None:
+    """성공적으로 전송한 기사 키를 원자적으로 로컬 이력에 저장한다."""
+    target = path or history_path()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    recorded_at = datetime.now(timezone.utc).isoformat()
+    updated = dict(records)
+    updated.update({key: recorded_at for key in new_keys})
+    temporary = target.with_suffix(".tmp")
+    temporary.write_text(
+        json.dumps({"version": 1, "sent": updated}, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    temporary.replace(target)
+
+
 def format_date(value: datetime | None) -> str:
     if value is None:
         return "시각 미상"
-    korea_time = value.astimezone(timezone(timedelta(hours=9)))
+    korea_time = value.astimezone(KST)
     return korea_time.strftime("%Y-%m-%d %H:%M KST")
 
 
@@ -357,7 +582,7 @@ def build_teams_message(topics: dict[str, list[Article]]) -> dict[str, str]:
         "%Y-%m-%d %H:%M KST"
     )
     lines = [
-        "<h2>📰 개인정보 보호 · AI 보안 최신 뉴스</h2>",
+        "<h2>📰 오늘 새로 확인된 개인정보 보호 · AI 보안 뉴스</h2>",
         f"<p><em>수집 시각: {html.escape(collected_at)}</em></p>",
     ]
     for keyword, articles in topics.items():
@@ -499,7 +724,7 @@ def get_kakao_config() -> KakaoConfig | None:
         client_secret=values["client_secret"] or "",
         refresh_token=values["refresh_token"] or "",
         link_url=get_user_setting("KAKAO_LINK_URL")
-        or "https://developers.kakao.com",
+        or "https://csh5751.github.io/privacy-news-report/",
     )
 
 
@@ -523,24 +748,18 @@ def refresh_kakao_access_token(config: KakaoConfig, timeout: float) -> str:
     return access_token
 
 
-def build_kakao_text(keyword: str, articles: list[Article]) -> str:
-    """카카오 텍스트 템플릿의 200자 제한에 맞는 주제 요약을 만든다."""
-    header = f"[{keyword}] 최신 뉴스\n"
-    footer = datetime.now(timezone(timedelta(hours=9))).strftime("\n%Y-%m-%d")
-    lines: list[str] = []
-    if not articles:
-        lines.append("검색된 뉴스가 없습니다.")
-    else:
-        for number, article in enumerate(articles, start=1):
-            line = f"{number}. {article.title}"
-            candidate = header + "\n".join(lines + [line]) + footer
-            if len(candidate) > 200:
-                break
-            lines.append(line)
-        if not lines:
-            available = 200 - len(header) - len(footer) - 2
-            lines.append(articles[0].title[:available] + "…")
-    return (header + "\n".join(lines) + footer)[:200]
+def build_kakao_text(topics: dict[str, list[Article]]) -> str:
+    """HTML 뉴스 보고서를 안내하는 카카오 메시지를 만든다."""
+    collected_at = datetime.now(timezone(timedelta(hours=9))).strftime(
+        "%Y-%m-%d %H:%M KST"
+    )
+    article_count = sum(len(articles) for articles in topics.values())
+    return (
+        "오늘 새로 확인된 개인정보 보호 · AI 보안 뉴스\n"
+        f"중복을 제외한 새 기사 {article_count}건을 정리했습니다.\n"
+        f"업데이트: {collected_at}\n"
+        "아래 버튼을 눌러 전체 HTML 보고서를 확인하세요."
+    )[:200]
 
 
 def send_topics_to_kakao(
@@ -548,27 +767,25 @@ def send_topics_to_kakao(
     topics: dict[str, list[Article]],
     timeout: float,
 ) -> None:
-    """액세스 토큰을 갱신하고 주제별 요약을 나와의 채팅으로 보낸다."""
+    """액세스 토큰을 갱신하고 HTML 보고서 링크를 한 번만 보낸다."""
     access_token = refresh_kakao_access_token(config, timeout)
-    for keyword, articles in topics.items():
-        template = {
-            "object_type": "text",
-            "text": build_kakao_text(keyword, articles),
-            "link": {
-                "web_url": config.link_url,
-                "mobile_web_url": config.link_url,
-            },
-            "button_title": "자세히 보기",
-        }
-        result = post_kakao_form(
-            KAKAO_MEMO_URL,
-            {"template_object": json.dumps(template, ensure_ascii=False)},
-            timeout,
-            access_token=access_token,
-        )
-        if result.get("result_code") != 0:
-            raise RuntimeError(f"카카오 메시지 전송 실패: {result}")
-        time.sleep(0.2)
+    template = {
+        "object_type": "text",
+        "text": build_kakao_text(topics),
+        "link": {
+            "web_url": config.link_url,
+            "mobile_web_url": config.link_url,
+        },
+        "button_title": "HTML 뉴스 보고서 보기",
+    }
+    result = post_kakao_form(
+        KAKAO_MEMO_URL,
+        {"template_object": json.dumps(template, ensure_ascii=False)},
+        timeout,
+        access_token=access_token,
+    )
+    if result.get("result_code") != 0:
+        raise RuntimeError(f"카카오 메시지 전송 실패: {result}")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -621,23 +838,28 @@ def run_news_cycle(
     kakao_config: KakaoConfig | None,
 ) -> int:
     """뉴스 수집과 콘솔 출력 및 Teams 전송을 한 차례 수행한다."""
-    print(f"{', '.join(keywords)} 주제의 최신 뉴스를 가져오는 중입니다...")
+    print(f"{', '.join(keywords)} 주제의 오늘 새 뉴스를 가져오는 중입니다...")
     failures = 0
     topics: dict[str, list[Article]] = {}
+    history = load_sent_history()
+    claimed_keys: set[str] = set()
+    claimed_articles: list[Article] = []
     for keyword in keywords:
         try:
             articles = unique_articles(
                 fetch_news(
                     keyword,
                     timeout=timeout,
-                    max_results=max(limit * 3, 10),
+                    max_results=max(limit * 6, 30),
                 )
             )
-            articles.sort(
-                key=lambda item: item.published or datetime.min.replace(tzinfo=timezone.utc),
-                reverse=True,
+            selected = select_today_articles(
+                articles,
+                limit,
+                excluded_keys=set(history),
+                claimed_keys=claimed_keys,
+                claimed_articles=claimed_articles,
             )
-            selected = articles[:limit]
             topics[keyword] = selected
             display_topic(keyword, selected, limit)
         except RuntimeError as exc:
@@ -655,9 +877,17 @@ def run_news_cycle(
     if kakao_config and topics:
         try:
             send_topics_to_kakao(kakao_config, topics, timeout)
-            print(f"[KakaoTalk] {len(topics)}개 주제 전송 완료")
+            print("[KakaoTalk] HTML 뉴스 보고서 링크 전송 완료")
         except RuntimeError as exc:
             print(f"\n[KakaoTalk] 전송 실패: {exc}", file=sys.stderr)
+            return 1
+
+    if claimed_keys and (webhook_url or kakao_config):
+        try:
+            save_sent_history(history, claimed_keys)
+            print(f"[이력] 새 기사 {len(claimed_keys)}개 식별값 저장 완료")
+        except OSError as exc:
+            print(f"\n[이력] 저장 실패: {exc}", file=sys.stderr)
             return 1
 
     return 1 if failures == len(keywords) else 0
