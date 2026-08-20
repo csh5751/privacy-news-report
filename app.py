@@ -11,12 +11,14 @@ import ssl
 import subprocess
 import sys
 import time
+import traceback
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from difflib import SequenceMatcher
 from email.utils import parsedate_to_datetime
+from io import TextIOBase
 from pathlib import Path
-from typing import Iterable
+from typing import Callable, Iterable, TypeVar
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, urlencode, urlparse
 from urllib.request import Request, urlopen
@@ -40,6 +42,9 @@ SENTENCE_RE = re.compile(r"(?<=[.!?。]|[다요죠])\s+")
 TEAMS_MAX_PAYLOAD_BYTES = 25_000
 KST = timezone(timedelta(hours=9))
 HISTORY_RETENTION_DAYS = 30
+LOG_RETENTION_DAYS = 30
+MAX_RETRY_ATTEMPTS = 3
+RETRY_DELAY_SECONDS = 2.0
 STORY_TOKEN_RE = re.compile(r"[가-힣A-Za-z0-9]+")
 STORY_STOPWORDS = {
     "ai", "개인정보", "개인정보보호", "보호", "관련", "대한", "위한",
@@ -53,6 +58,7 @@ SOURCE_TIERS = (
     (75, ("뉴스1", "뉴시스", "이투데이", "아시아투데이")),
 )
 AGGREGATOR_HOSTS = ("msn.com", "news.nate.com", "zum.com")
+T = TypeVar("T")
 
 
 @dataclass(frozen=True)
@@ -72,6 +78,89 @@ class KakaoConfig:
     client_secret: str
     refresh_token: str
     link_url: str
+
+
+class TimestampedTee(TextIOBase):
+    """콘솔 출력은 유지하면서 완성된 각 줄을 시각과 함께 로그에 기록한다."""
+
+    def __init__(self, original: TextIOBase, log_file: TextIOBase, level: str):
+        self.original = original
+        self.log_file = log_file
+        self.level = level
+        self.buffer = ""
+
+    def write(self, value: str) -> int:
+        self.original.write(value)
+        self.original.flush()
+        self.buffer += value
+        while "\n" in self.buffer:
+            line, self.buffer = self.buffer.split("\n", 1)
+            timestamp = datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S KST")
+            self.log_file.write(f"[{timestamp}] [{self.level}] {line}\n")
+            self.log_file.flush()
+        return len(value)
+
+    def flush(self) -> None:
+        self.original.flush()
+        if self.buffer:
+            timestamp = datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S KST")
+            self.log_file.write(f"[{timestamp}] [{self.level}] {self.buffer}\n")
+            self.buffer = ""
+        self.log_file.flush()
+
+    @property
+    def encoding(self) -> str | None:
+        return getattr(self.original, "encoding", None)
+
+
+def logs_directory() -> Path:
+    """사용자별 실행 로그 디렉터리를 반환한다."""
+    return history_path().parent / "logs"
+
+
+def cleanup_old_logs(directory: Path) -> None:
+    """보관 기간이 지난 실행 로그만 삭제한다."""
+    cutoff = datetime.now(timezone.utc) - timedelta(days=LOG_RETENTION_DAYS)
+    for path in directory.glob("news-report-*.log"):
+        try:
+            modified = datetime.fromtimestamp(path.stat().st_mtime, timezone.utc)
+            if modified < cutoff:
+                path.unlink()
+        except OSError:
+            continue
+
+
+def retry_operation(
+    name: str,
+    operation: Callable[[], T],
+    attempts: int = MAX_RETRY_ATTEMPTS,
+    delay_seconds: float = RETRY_DELAY_SECONDS,
+    sleep_func: Callable[[float], None] = time.sleep,
+) -> T:
+    """실패한 작업을 최초 시도 포함 최대 지정 횟수만큼 실행한다."""
+    if attempts < 1:
+        raise ValueError("재시도 횟수는 1 이상이어야 합니다.")
+    for attempt in range(1, attempts + 1):
+        try:
+            result = operation()
+            if attempt > 1:
+                print(f"[재시도 성공] {name}: {attempt}/{attempts}회차")
+            return result
+        except RuntimeError as exc:
+            if attempt >= attempts:
+                print(
+                    f"[최종 실패] {name}: {attempt}/{attempts}회차 - {exc}",
+                    file=sys.stderr,
+                )
+                raise
+            delay = delay_seconds * attempt
+            print(
+                f"[재시도] {name}: {attempt}/{attempts}회차 실패 - {exc}; "
+                f"{delay:g}초 후 다시 시도",
+                file=sys.stderr,
+            )
+            sleep_func(delay)
+    raise RuntimeError(f"{name} 재시도가 예기치 않게 종료됐습니다.")
 
 
 def clean_text(value: str | None) -> str:
@@ -847,10 +936,13 @@ def run_news_cycle(
     for keyword in keywords:
         try:
             articles = unique_articles(
-                fetch_news(
-                    keyword,
-                    timeout=timeout,
-                    max_results=max(limit * 6, 30),
+                retry_operation(
+                    f"뉴스 수집({keyword})",
+                    lambda: fetch_news(
+                        keyword,
+                        timeout=timeout,
+                        max_results=max(limit * 6, 30),
+                    ),
                 )
             )
             selected = select_today_articles(
@@ -868,7 +960,10 @@ def run_news_cycle(
 
     if webhook_url and topics:
         try:
-            send_to_teams(webhook_url, topics, timeout)
+            retry_operation(
+                "Teams 전송",
+                lambda: send_to_teams(webhook_url, topics, timeout),
+            )
             print(f"[Teams] {len(topics)}개 주제를 본문 하나로 전송 완료")
         except RuntimeError as exc:
             print(f"\n[Teams] 전송 실패: {exc}", file=sys.stderr)
@@ -876,7 +971,10 @@ def run_news_cycle(
 
     if kakao_config and topics:
         try:
-            send_topics_to_kakao(kakao_config, topics, timeout)
+            retry_operation(
+                "카카오톡 전송",
+                lambda: send_topics_to_kakao(kakao_config, topics, timeout),
+            )
             print("[KakaoTalk] HTML 뉴스 보고서 링크 전송 완료")
         except RuntimeError as exc:
             print(f"\n[KakaoTalk] 전송 실패: {exc}", file=sys.stderr)
@@ -947,5 +1045,42 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
 
+def run_with_logging(argv: list[str] | None = None) -> int:
+    """실행별 상세 로그를 남기고 미처리 예외도 종료 코드 1로 기록한다."""
+    directory = logs_directory()
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+        cleanup_old_logs(directory)
+        started_at = datetime.now(KST)
+        log_path = directory / started_at.strftime("news-report-%Y%m%d-%H%M%S.log")
+        log_file = log_path.open("a", encoding="utf-8", buffering=1)
+    except OSError as exc:
+        print(f"[로그] 로그 파일을 준비할 수 없습니다: {exc}", file=sys.stderr)
+        return 1
+
+    original_stdout = sys.stdout
+    original_stderr = sys.stderr
+    sys.stdout = TimestampedTee(original_stdout, log_file, "INFO")
+    sys.stderr = TimestampedTee(original_stderr, log_file, "ERROR")
+    result = 1
+    try:
+        print(f"[로그] 실행 로그: {log_path}")
+        print(f"[시작] 인자: {argv if argv is not None else sys.argv[1:]}")
+        result = main(argv)
+        print(f"[종료] 종료 코드: {result}")
+    except BaseException:
+        print("[예외] 처리되지 않은 예외가 발생했습니다.", file=sys.stderr)
+        traceback.print_exc(file=sys.stderr)
+        result = 1
+        print(f"[종료] 종료 코드: {result}", file=sys.stderr)
+    finally:
+        sys.stdout.flush()
+        sys.stderr.flush()
+        sys.stdout = original_stdout
+        sys.stderr = original_stderr
+        log_file.close()
+    return result
+
+
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(run_with_logging())

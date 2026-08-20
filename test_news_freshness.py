@@ -95,6 +95,40 @@ class FreshNewsTests(unittest.TestCase):
             <= claimed
         )
 
+    def test_retry_succeeds_on_third_attempt(self):
+        calls = 0
+        delays: list[float] = []
+
+        def operation():
+            nonlocal calls
+            calls += 1
+            if calls < 3:
+                raise RuntimeError(f"temporary-{calls}")
+            return "success"
+
+        result = app.retry_operation(
+            "테스트", operation, sleep_func=delays.append
+        )
+
+        self.assertEqual("success", result)
+        self.assertEqual(3, calls)
+        self.assertEqual([2.0, 4.0], delays)
+
+    def test_retry_stops_after_three_failures(self):
+        calls = 0
+
+        def operation():
+            nonlocal calls
+            calls += 1
+            raise RuntimeError("persistent")
+
+        with self.assertRaisesRegex(RuntimeError, "persistent"):
+            app.retry_operation(
+                "테스트", operation, sleep_func=lambda _: None
+            )
+
+        self.assertEqual(3, calls)
+
 
 if __name__ == "__main__":
     unittest.main()

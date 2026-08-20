@@ -146,7 +146,14 @@ def main(argv: list[str] | None = None) -> int:
         print(f"[수집] {keyword}")
         try:
             articles = app.unique_articles(
-                app.fetch_news(keyword, timeout=args.timeout, max_results=max(args.limit * 3, 10))
+                app.retry_operation(
+                    f"뉴스 수집({keyword})",
+                    lambda: app.fetch_news(
+                        keyword,
+                        timeout=args.timeout,
+                        max_results=max(args.limit * 3, 10),
+                    ),
+                )
             )
             topics[keyword] = app.select_today_articles(
                 articles,
