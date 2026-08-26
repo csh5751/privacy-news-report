@@ -129,6 +129,12 @@ class FreshNewsTests(unittest.TestCase):
 
         self.assertEqual(3, calls)
 
+    def test_kakao_is_opt_in(self):
+        parser = app.build_parser()
+
+        self.assertFalse(parser.parse_args([]).kakao)
+        self.assertTrue(parser.parse_args(["--kakao"]).kakao)
+
 
 if __name__ == "__main__":
     unittest.main()

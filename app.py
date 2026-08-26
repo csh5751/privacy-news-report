@@ -912,9 +912,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="TEAMS_WEBHOOK_URL이 설정되어 있어도 Teams 전송을 생략합니다.",
     )
     parser.add_argument(
+        "--kakao",
+        action="store_true",
+        help="카카오 환경변수가 설정된 경우 카카오톡 전송을 명시적으로 사용합니다.",
+    )
+    parser.add_argument(
         "--no-kakao",
         action="store_true",
-        help="카카오 환경변수가 설정되어 있어도 카카오톡 전송을 생략합니다.",
+        help="카카오톡 전송을 생략합니다(기본 동작이며 이전 명령과의 호환용).",
     )
     return parser
 
@@ -1013,11 +1018,13 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 2
     try:
-        kakao_config = None if args.no_kakao else get_kakao_config()
+        kakao_config = (
+            get_kakao_config() if args.kakao and not args.no_kakao else None
+        )
     except RuntimeError as exc:
         print(f"오류: {exc}", file=sys.stderr)
         return 2
-    if not kakao_config and not args.no_kakao:
+    if args.kakao and not kakao_config:
         print(
             "안내: 카카오 환경변수가 없어 카카오톡 전송을 생략합니다.",
             file=sys.stderr,
