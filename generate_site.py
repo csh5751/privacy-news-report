@@ -14,41 +14,52 @@ import app
 KST = timezone(timedelta(hours=9))
 
 
-def article_html(article: app.Article) -> str:
-    title = html.escape(article.title)
+def story_html(story: app.Story) -> str:
+    article = story.representative
+    headline = html.escape(story.headline)
     link = html.escape(article.link, quote=True)
     source = html.escape(article.source)
     published = html.escape(app.format_date(article.published))
-    summary = html.escape(app.summarize(article, max_length=240))
+    summary = html.escape(app.story_summary(story, max_length=280))
+    related = ""
+    if story.related:
+        names = html.escape(", ".join(item.source for item in story.related[:5]))
+        related = f'<p class="related">관련 보도 {len(story.related)}건 · {names}</p>'
     return f"""
       <article class="article">
-        <h3><a href="{link}" target="_blank" rel="noopener noreferrer">{title}</a></h3>
-        <p class="meta">{source}<span aria-hidden="true"> · </span>{published}</p>
-        <p class="summary">{summary}</p>
+        <h3><a href="{link}" target="_blank" rel="noopener noreferrer">{headline}</a></h3>
+        <p class="meta">{source}<span aria-hidden="true"> · </span>{published}<span aria-hidden="true"> · </span>중요도 {story.importance}</p>
+        <p class="summary">{summary}</p>{related}
         <a class="article-link" href="{link}" target="_blank" rel="noopener noreferrer">원문 보기 <span aria-hidden="true">→</span></a>
       </article>"""
 
 
-def topic_html(keyword: str, articles: list[app.Article]) -> str:
-    keyword_text = html.escape(keyword)
-    if articles:
-        contents = "".join(article_html(article) for article in articles)
-    else:
-        contents = '<p class="empty">검색된 뉴스가 없습니다.</p>'
+def section_html(title: str, stories: list[app.Story]) -> str:
+    title_text = html.escape(title)
+    contents = "".join(story_html(story) for story in stories)
     return f"""
     <details class="topic" open>
       <summary>
-        <span>{keyword_text}</span>
-        <span class="count">{len(articles)}건</span>
+        <span>{title_text}</span>
+        <span class="count">{len(stories)}건</span>
       </summary>
       <div class="articles">{contents}
       </div>
     </details>"""
 
 
-def build_page(topics: dict[str, list[app.Article]], generated_at: datetime) -> str:
-    total = sum(len(articles) for articles in topics.values())
-    sections = "".join(topic_html(keyword, articles) for keyword, articles in topics.items())
+def build_page(topics: dict[str, list[app.Story]], generated_at: datetime) -> str:
+    total = sum(len(stories) for stories in topics.values())
+    if topics:
+        sections = "".join(
+            section_html(title, stories) for title, stories in topics.items()
+        )
+    else:
+        sections = """
+    <details class="topic" open>
+      <summary><span>새 뉴스</span><span class="count">0건</span></summary>
+      <div class="articles"><p class="empty">보고할 새 뉴스가 없습니다.</p></div>
+    </details>"""
     updated = html.escape(generated_at.astimezone(KST).strftime("%Y년 %m월 %d일 %H:%M KST"))
     return f"""<!doctype html>
 <html lang="ko">
@@ -89,6 +100,7 @@ def build_page(topics: dict[str, list[app.Article]], generated_at: datetime) -> 
     .article h3 a:hover, .article-link:hover {{ color: var(--accent); text-decoration: underline; }}
     .meta {{ margin: 0 0 10px; color: var(--muted); font-size: .82rem; }}
     .summary {{ margin: 0 0 13px; color: var(--text); font-size: .92rem; }}
+    .related {{ margin: 0 0 13px; color: var(--muted); font-size: .8rem; }}
     .article-link {{ color: var(--accent); font-size: .86rem; font-weight: 700; text-decoration: none; }}
     .empty {{ padding: 24px; color: var(--muted); }}
     footer {{ padding: 24px 0 42px; color: var(--muted); text-align: center; font-size: .82rem; }}
@@ -109,7 +121,7 @@ def build_page(topics: dict[str, list[app.Article]], generated_at: datetime) -> 
       <p>주요 개인정보 보호 정책과 보안 이슈를 한곳에서 확인하세요.</p>
       <div class="stats">
         <span class="badge">주제 {len(topics)}개</span>
-        <span class="badge">기사 {total}건</span>
+        <span class="badge">사건 {total}건</span>
         <span class="badge">업데이트 {updated}</span>
       </div>
     </div>
@@ -125,8 +137,19 @@ def build_page(topics: dict[str, list[app.Article]], generated_at: datetime) -> 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="GitHub Pages용 뉴스 보고서를 생성합니다.")
     parser.add_argument("keywords", nargs="*", help="검색 키워드. 생략하면 app.py 기본값 사용")
-    parser.add_argument("-n", "--limit", type=int, default=5, help="주제별 기사 수")
+    parser.add_argument("-n", "--limit", type=int, default=12, help="보고서 전체 사건 수")
     parser.add_argument("--timeout", type=float, default=20.0, help="요청 제한 시간(초)")
+    parser.add_argument(
+        "--window-hours",
+        type=int,
+        default=app.DEFAULT_WINDOW_HOURS,
+        help="이 시간 안에 게시된 기사만 후보로 씁니다",
+    )
+    parser.add_argument(
+        "--no-claude",
+        action="store_true",
+        help="Claude 큐레이션을 건너뛰고 휴리스틱으로만 정리합니다.",
+    )
     parser.add_argument("--output", default="site/index.html", help="생성할 HTML 경로")
     return parser.parse_args(argv)
 
@@ -136,41 +159,31 @@ def main(argv: list[str] | None = None) -> int:
     if args.limit < 1 or args.timeout <= 0:
         print("오류: limit는 1 이상, timeout은 0보다 커야 합니다.", file=sys.stderr)
         return 2
+    if args.window_hours < 1:
+        print("오류: 시간 창은 1 이상이어야 합니다.", file=sys.stderr)
+        return 2
 
     keywords = app.parse_keywords(args.keywords) or app.DEFAULT_KEYWORDS.copy()
-    topics: dict[str, list[app.Article]] = {}
-    claimed_keys: set[str] = set()
-    claimed_articles: list[app.Article] = []
-    failures = 0
-    for keyword in keywords:
-        print(f"[수집] {keyword}")
-        try:
-            articles = app.unique_articles(
-                app.retry_operation(
-                    f"뉴스 수집({keyword})",
-                    lambda: app.fetch_news(
-                        keyword,
-                        timeout=args.timeout,
-                        max_results=max(args.limit * 3, 10),
-                    ),
-                )
-            )
-            topics[keyword] = app.select_today_articles(
-                articles,
-                args.limit,
-                claimed_keys=claimed_keys,
-                claimed_articles=claimed_articles,
-            )
-        except RuntimeError as exc:
-            failures += 1
-            topics[keyword] = []
-            print(f"[경고] {keyword}: {exc}", file=sys.stderr)
+    api_key = None if args.no_claude else app.get_anthropic_api_key()
+    if not args.no_claude and not api_key:
+        print(
+            "안내: ANTHROPIC_API_KEY가 없어 휴리스틱 정리로 실행합니다.",
+            file=sys.stderr,
+        )
+
+    # 보고서는 전체 현황을 보여주는 페이지라 전송 이력으로 걸러내지 않는다.
+    sections, failures = app.build_report(
+        keywords, args.limit, args.timeout, args.window_hours, api_key
+    )
 
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text(build_page(topics, datetime.now(timezone.utc)), encoding="utf-8")
-    print(f"[완료] {output.resolve()} ({sum(map(len, topics.values()))}건)")
-    return 1 if failures == len(keywords) else 0
+    output.write_text(
+        build_page(sections, datetime.now(timezone.utc)), encoding="utf-8"
+    )
+    total = sum(len(stories) for stories in sections.values())
+    print(f"[완료] {output.resolve()} ({total}건)")
+    return 1 if keywords and failures == len(keywords) else 0
 
 
 if __name__ == "__main__":

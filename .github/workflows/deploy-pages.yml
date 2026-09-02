@@ -30,8 +30,17 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.13"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
 
       - name: Generate report
+        # 키가 없으면 Claude 큐레이션을 건너뛰고 휴리스틱으로 생성된다.
+        # ANTHROPIC_WORKSPACE_ID는 조직의 identity-linked 키를 쓸 때만 필요하다.
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          ANTHROPIC_WORKSPACE_ID: ${{ secrets.ANTHROPIC_WORKSPACE_ID }}
         run: python generate_site.py --output site/index.html
 
       - name: Configure Pages

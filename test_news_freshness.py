@@ -6,95 +6,350 @@ from pathlib import Path
 import app
 
 
-class FreshNewsTests(unittest.TestCase):
+GOOGLE_FEED = """<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0"><channel>
+  <item>
+    <title>개인정보위, A사에 과징금 12억원 부과 - 연합뉴스</title>
+    <link>https://news.google.com/rss/articles/ABC?oc=5</link>
+    <pubDate>Wed, 02 Sep 2026 04:36:39 GMT</pubDate>
+    <description>&lt;a href="https://news.google.com/x"&gt;제목&lt;/a&gt;</description>
+    <source url="https://www.yna.co.kr">연합뉴스</source>
+  </item>
+  <item>
+    <title>제목만 있는 기사</title>
+    <link>https://news.google.com/rss/articles/DEF?oc=5</link>
+    <pubDate>Wed, 02 Sep 2026 03:00:00 GMT</pubDate>
+    <source url="https://example.com">테스트신문</source>
+  </item>
+</channel></rss>
+"""
+
+
+def article(
+    title: str,
+    link: str,
+    published: datetime,
+    source: str = "테스트",
+    description: str = "",
+) -> app.Article:
+    return app.Article(title, link, source, published, description)
+
+
+class FeedParsingTests(unittest.TestCase):
+    def test_google_feed_strips_source_suffix_and_reads_source_tag(self):
+        original = app.read_feed
+        app.read_feed = lambda url, timeout: __import__(
+            "xml.etree.ElementTree", fromlist=["ElementTree"]
+        ).fromstring(GOOGLE_FEED)
+        try:
+            articles = app.fetch_google_news("개인정보", timeout=1)
+        finally:
+            app.read_feed = original
+
+        self.assertEqual(2, len(articles))
+        self.assertEqual("개인정보위, A사에 과징금 12억원 부과", articles[0].title)
+        self.assertEqual("연합뉴스", articles[0].source)
+        # Google의 description은 앵커뿐이라 요약 재료로 쓰지 않는다.
+        self.assertEqual("", articles[0].description)
+
+    def test_strip_source_suffix_keeps_titles_with_internal_dashes(self):
+        self.assertEqual(
+            "개인정보위, A사에 과징금",
+            app.strip_source_suffix("개인정보위, A사에 과징금 - 연합뉴스", "연합뉴스"),
+        )
+        self.assertEqual("단독", app.strip_source_suffix("단독", "연합뉴스"))
+
+    def test_fetch_news_survives_a_single_source_failure(self):
+        good = [article("살아남은 기사", "https://a.test/1", datetime.now(timezone.utc))]
+        original_google, original_bing = app.fetch_google_news, app.fetch_bing_news
+        app.fetch_google_news = lambda *a, **k: (_ for _ in ()).throw(
+            RuntimeError("구글 실패")
+        )
+        app.fetch_bing_news = lambda *a, **k: good
+        try:
+            self.assertEqual(good, app.fetch_news("개인정보", timeout=1))
+        finally:
+            app.fetch_google_news, app.fetch_bing_news = original_google, original_bing
+
+    def test_fetch_news_raises_only_when_every_source_fails(self):
+        def boom(*args, **kwargs):
+            raise RuntimeError("실패")
+
+        original_google, original_bing = app.fetch_google_news, app.fetch_bing_news
+        app.fetch_google_news = boom
+        app.fetch_bing_news = boom
+        try:
+            with self.assertRaisesRegex(RuntimeError, "모든 뉴스 소스가 실패"):
+                app.fetch_news("개인정보", timeout=1)
+        finally:
+            app.fetch_google_news, app.fetch_bing_news = original_google, original_bing
+
+
+class CandidateSelectionTests(unittest.TestCase):
     def setUp(self):
-        self.now = datetime(2026, 8, 19, 1, 0, tzinfo=timezone.utc)
+        self.now = datetime(2026, 9, 2, 1, 0, tzinfo=timezone.utc)
 
-    def article(
-        self,
-        title: str,
-        link: str,
-        published: datetime,
-        source: str = "테스트",
-        description: str | None = None,
-    ) -> app.Article:
-        return app.Article(title, link, source, published, description or title)
-
-    def test_only_today_kst_and_global_duplicates_are_selected(self):
-        today = self.article("오늘 기사", "https://example.com/a?utm_source=x", self.now)
-        duplicate = self.article("오늘 기사", "https://example.com/other", self.now)
-        yesterday = self.article(
-            "어제 기사", "https://example.com/b", self.now - timedelta(days=1)
+    def test_window_keeps_yesterday_evening_and_drops_older(self):
+        # 조간 실행 시 전날 저녁 기사를 놓치지 않아야 한다.
+        last_evening = article(
+            "전날 저녁", "https://a.test/1", self.now - timedelta(hours=8)
         )
-        claimed: set[str] = set()
+        stale = article("오래된 기사", "https://a.test/2", self.now - timedelta(days=4))
 
-        first = app.select_today_articles(
-            [yesterday, today], 5, claimed_keys=claimed, now=self.now
-        )
-        second = app.select_today_articles(
-            [duplicate], 5, claimed_keys=claimed, now=self.now
+        selected = app.select_recent_articles(
+            [stale, last_evening], window_hours=30, now=self.now
         )
 
-        self.assertEqual([today], first)
-        self.assertEqual([], second)
+        self.assertEqual([last_evening], selected)
 
-    def test_sent_history_excludes_previously_sent_article(self):
-        article = self.article("전송 완료", "https://example.com/a", self.now)
+    def test_undated_and_future_articles_are_dropped(self):
+        undated = app.Article("시각 미상", "https://a.test/1", "테스트", None, "")
+        future = article("미래 기사", "https://a.test/2", self.now + timedelta(hours=3))
+
+        self.assertEqual(
+            [], app.select_recent_articles([undated, future], now=self.now)
+        )
+
+    def test_sent_history_excludes_previously_reported_article(self):
+        reported = article("전송 완료", "https://a.test/1", self.now)
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "history.json"
-            app.save_sent_history({}, app.article_keys(article), path)
+            app.save_sent_history({}, app.article_keys(reported), path)
             history = app.load_sent_history(path)
 
-            selected = app.select_today_articles(
-                [article], 5, excluded_keys=set(history), now=self.now
+            selected = app.select_recent_articles(
+                [reported], excluded_keys=set(history), now=self.now
             )
 
         self.assertEqual([], selected)
 
-    def test_same_event_uses_one_credible_representative(self):
-        articles = [
-            self.article(
-                "네이버, AI 시대 개인정보 보호 아이디어 발굴…대학생 10개팀 경쟁",
-                "https://www.metroseoul.co.kr/article/20260819500147",
-                self.now,
-                "메트로신문",
-                "네이버는 개인정보보호 관련 아이디어 공모전 네이버 프라이버시 챌린지를 진행했다.",
-            ),
-            self.article(
-                "네이버, 개인정보보호 아이디어 공모전 개최",
-                "https://www.msn.com/ko-kr/news/other/naver-privacy/ar-AA2aqfvr",
-                self.now - timedelta(hours=2),
-                "아이뉴스24 on MSN",
-                "네이버는 개인정보보호 관련 아이디어 공모전 네이버 프라이버시 챌린지를 진행했다고 밝혔다.",
-            ),
-            self.article(
-                "네이버, AI 시대 개인정보보호 아이디어 발굴…대학생 공모전 개최",
-                "https://www.msn.com/ko-kr/news/news/naver-ai/ar-AA2aqjVg",
-                self.now - timedelta(hours=3),
-                "이투데이 on MSN",
-                "네이버가 AI 시대 개인정보보호 강화를 위한 대학생 아이디어 발굴에 나섰다.",
-            ),
-            self.article(
-                "네이버, 개인정보보호 아이디어 공모전 '프라이버시 챌린지' 진행",
-                "https://www.msn.com/ko-kr/tech/naver-challenge/ar-AA2aq9Tk",
-                self.now - timedelta(hours=4),
-                "아시아투데이 on MSN",
-                "네이버는 개인정보보호 관련 아이디어 공모전 프라이버시 챌린지를 진행했다.",
-            ),
+    def test_duplicate_titles_merge_and_keep_the_described_copy(self):
+        # Google은 설명을 주지 않으므로 같은 제목이면 Bing 쪽을 남겨야 한다.
+        bare = article("같은 제목", "https://news.google.com/rss/articles/X", self.now)
+        described = article(
+            "같은 제목",
+            "https://www.yna.co.kr/view/1",
+            self.now,
+            "연합뉴스",
+            "과징금 12억원이 부과됐다.",
+        )
+
+        merged = app.merge_duplicate_articles([bare, described])
+
+        self.assertEqual([described], merged)
+
+    def test_stale_copy_does_not_swallow_the_fresh_one(self):
+        # 같은 제목이라도 창 밖 사본이 대표로 뽑혀 기사가 사라지면 안 된다.
+        stale_but_detailed = article(
+            "같은 제목",
+            "https://www.yna.co.kr/view/1",
+            self.now - timedelta(days=4),
+            "연합뉴스",
+            "긴 설명이 붙어 있는 오래된 사본입니다.",
+        )
+        fresh = article(
+            "같은 제목", "https://news.google.com/rss/articles/X", self.now
+        )
+
+        selected = app.select_recent_articles(
+            [stale_but_detailed, fresh], window_hours=30, now=self.now
+        )
+
+        self.assertEqual([fresh], selected)
+
+    def test_same_story_ignores_date_tokens(self):
+        left = article("19일 개인정보위 전체회의", "https://a.test/1", self.now)
+        right = article("18일 방통위 상임위원 간담회", "https://a.test/2", self.now)
+
+        # 날짜 표기만 다른 두 기사가 유사도로 묶이면 안 된다.
+        self.assertFalse(app.same_story(left, right))
+
+
+class CurationTests(unittest.TestCase):
+    def setUp(self):
+        self.now = datetime(2026, 9, 2, 1, 0, tzinfo=timezone.utc)
+        self.candidates = [
+            article("A사 과징금 12억", "https://a.test/1", self.now, "연합뉴스"),
+            article("A사에 과징금 부과", "https://a.test/2", self.now, "이투데이"),
+            article("공모전 개최", "https://a.test/3", self.now, "전자신문"),
         ]
 
-        claimed: set[str] = set()
-        selected = app.select_today_articles(
-            articles, 5, claimed_keys=claimed, now=self.now
+    def payload(self):
+        return {
+            "sections": [
+                {
+                    "title": "제재·과징금",
+                    "stories": [
+                        {
+                            "headline": "개인정보위, A사에 과징금 12억원 부과",
+                            "summary": "개인정보위가 A사에 과징금을 부과했다.",
+                            "importance": 5,
+                            "representative": 0,
+                            "related": [1],
+                        }
+                    ],
+                },
+                {
+                    "title": "행사",
+                    "stories": [
+                        {
+                            "headline": "공모전 개최",
+                            "summary": "공모전이 열린다.",
+                            "importance": 1,
+                            "representative": 2,
+                            "related": [],
+                        }
+                    ],
+                },
+            ]
+        }
+
+    def test_build_stories_groups_related_articles(self):
+        stories = app.build_stories(self.payload(), self.candidates, limit=12)
+
+        self.assertEqual(2, len(stories))
+        self.assertEqual("제재·과징금", stories[0].section)
+        self.assertEqual(5, stories[0].importance)
+        self.assertEqual(self.candidates[0], stories[0].representative)
+        self.assertEqual((self.candidates[1],), stories[0].related)
+        # 중요도 내림차순으로 정렬된다.
+        self.assertEqual([5, 1], [story.importance for story in stories])
+
+    def test_build_stories_drops_out_of_range_and_reused_indexes(self):
+        payload = {
+            "sections": [
+                {
+                    "title": "구획",
+                    "stories": [
+                        {
+                            "headline": "첫 사건",
+                            "summary": "",
+                            "importance": 4,
+                            "representative": 0,
+                            "related": [99, 1],
+                        },
+                        {
+                            "headline": "같은 기사를 재사용",
+                            "summary": "",
+                            "importance": 4,
+                            "representative": 1,
+                            "related": [],
+                        },
+                        {
+                            "headline": "없는 기사",
+                            "summary": "",
+                            "importance": 4,
+                            "representative": 42,
+                            "related": [],
+                        },
+                    ],
+                }
+            ]
+        }
+
+        stories = app.build_stories(payload, self.candidates, limit=12)
+
+        self.assertEqual(1, len(stories))
+        self.assertEqual((self.candidates[1],), stories[0].related)
+
+    def test_build_stories_honours_limit(self):
+        stories = app.build_stories(self.payload(), self.candidates, limit=1)
+
+        self.assertEqual(1, len(stories))
+        self.assertEqual(5, stories[0].importance)
+
+    def test_build_stories_rejects_payload_without_usable_articles(self):
+        payload = {"sections": [{"title": "구획", "stories": []}]}
+
+        with self.assertRaises(RuntimeError):
+            app.build_stories(payload, self.candidates, limit=12)
+
+    def test_curate_falls_back_to_heuristics_when_claude_fails(self):
+        original = app.curate_with_claude
+
+        def boom(*args, **kwargs):
+            raise RuntimeError("Claude API 500 오류")
+
+        app.curate_with_claude = boom
+        try:
+            stories = app.curate(self.candidates, limit=12, api_key="test-key")
+        finally:
+            app.curate_with_claude = original
+
+        self.assertTrue(stories)
+        self.assertTrue(all(story.section == "수집 기사" for story in stories))
+
+    def test_curate_uses_heuristics_without_an_api_key(self):
+        stories = app.curate(self.candidates, limit=12, api_key=None)
+
+        self.assertTrue(stories)
+        # 유사한 제목의 두 기사는 한 사건으로 묶이고 신뢰도 높은 쪽이 대표가 된다.
+        merged = next(story for story in stories if story.related)
+        self.assertEqual("연합뉴스", merged.representative.source)
+
+    def test_curate_returns_nothing_for_an_empty_pool(self):
+        self.assertEqual([], app.curate([], limit=12, api_key="test-key"))
+
+    def test_group_sections_orders_by_highest_importance(self):
+        stories = app.build_stories(self.payload(), self.candidates, limit=12)
+
+        sections = app.group_sections(stories)
+
+        self.assertEqual(["제재·과징금", "행사"], list(sections))
+
+
+class OutputTests(unittest.TestCase):
+    def setUp(self):
+        now = datetime(2026, 9, 2, 1, 0, tzinfo=timezone.utc)
+        self.story = app.Story(
+            section="제재·과징금",
+            headline="개인정보위, A사에 과징금 12억원 부과",
+            summary="개인정보위가 A사에 과징금을 부과했다.",
+            importance=5,
+            representative=article(
+                "A사 과징금 12억", "https://a.test/1", now, "연합뉴스"
+            ),
+            related=(article("A사 과징금", "https://a.test/2", now, "이투데이"),),
         )
 
-        self.assertEqual(1, len(selected))
-        self.assertEqual("아이뉴스24 on MSN", selected[0].source)
-        self.assertTrue(
-            set().union(*(app.article_keys(article) for article in articles))
-            <= claimed
+    def test_teams_message_carries_headline_summary_and_related_sources(self):
+        text = app.build_teams_message({"제재·과징금": [self.story]})["text"]
+
+        self.assertIn("제재·과징금 (1건)", text)
+        self.assertIn("개인정보위, A사에 과징금 12억원 부과", text)
+        self.assertIn("개인정보위가 A사에 과징금을 부과했다.", text)
+        self.assertIn("중요도 5", text)
+        self.assertIn("이투데이", text)
+        self.assertIn('href="https://a.test/1"', text)
+
+    def test_teams_message_reports_an_empty_run(self):
+        text = app.build_teams_message({})["text"]
+
+        self.assertIn("보고할 새 뉴스가 없습니다.", text)
+
+    def test_story_summary_falls_back_to_the_article_description(self):
+        now = datetime(2026, 9, 2, 1, 0, tzinfo=timezone.utc)
+        story = app.Story(
+            section="구획",
+            headline="제목",
+            summary="",
+            importance=3,
+            representative=article(
+                "제목", "https://a.test/1", now, "연합뉴스", "본문 설명입니다."
+            ),
         )
 
+        self.assertIn("본문 설명입니다.", app.story_summary(story))
+
+    def test_kakao_text_counts_sections_and_stories(self):
+        text = app.build_kakao_text({"제재·과징금": [self.story]})
+
+        self.assertIn("1개 주제", text)
+        self.assertIn("새 사건 1건", text)
+        self.assertLessEqual(len(text), 200)
+
+
+class RetryTests(unittest.TestCase):
     def test_retry_succeeds_on_third_attempt(self):
         calls = 0
         delays: list[float] = []
@@ -106,13 +361,25 @@ class FreshNewsTests(unittest.TestCase):
                 raise RuntimeError(f"temporary-{calls}")
             return "success"
 
-        result = app.retry_operation(
-            "테스트", operation, sleep_func=delays.append
-        )
+        result = app.retry_operation("테스트", operation, sleep_func=delays.append)
 
         self.assertEqual("success", result)
         self.assertEqual(3, calls)
         self.assertEqual([2.0, 4.0], delays)
+
+    def test_retry_gives_up_immediately_on_a_permanent_failure(self):
+        calls = 0
+
+        def operation():
+            nonlocal calls
+            calls += 1
+            raise app.PermanentError("워크스페이스 ID 누락")
+
+        with self.assertRaisesRegex(app.PermanentError, "워크스페이스"):
+            app.retry_operation("테스트", operation, sleep_func=lambda _: None)
+
+        # 설정 오류는 재시도해도 같은 결과라 한 번만 호출해야 한다.
+        self.assertEqual(1, calls)
 
     def test_retry_stops_after_three_failures(self):
         calls = 0
@@ -123,17 +390,26 @@ class FreshNewsTests(unittest.TestCase):
             raise RuntimeError("persistent")
 
         with self.assertRaisesRegex(RuntimeError, "persistent"):
-            app.retry_operation(
-                "테스트", operation, sleep_func=lambda _: None
-            )
+            app.retry_operation("테스트", operation, sleep_func=lambda _: None)
 
         self.assertEqual(3, calls)
 
+
+class ParserTests(unittest.TestCase):
     def test_kakao_is_opt_in(self):
         parser = app.build_parser()
 
         self.assertFalse(parser.parse_args([]).kakao)
         self.assertTrue(parser.parse_args(["--kakao"]).kakao)
+
+    def test_claude_is_on_by_default_and_can_be_disabled(self):
+        parser = app.build_parser()
+
+        self.assertFalse(parser.parse_args([]).no_claude)
+        self.assertTrue(parser.parse_args(["--no-claude"]).no_claude)
+        self.assertEqual(
+            app.DEFAULT_WINDOW_HOURS, parser.parse_args([]).window_hours
+        )
 
 
 if __name__ == "__main__":

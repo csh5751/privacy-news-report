@@ -26,6 +26,7 @@ from xml.etree import ElementTree
 
 
 BING_NEWS_URL = "https://www.bing.com/news/search"
+GOOGLE_NEWS_URL = "https://news.google.com/rss/search"
 KAKAO_TOKEN_URL = "https://kauth.kakao.com/oauth/token"
 KAKAO_MEMO_URL = "https://kapi.kakao.com/v2/api/talk/memo/default/send"
 USER_AGENT = "Mozilla/5.0 (compatible; KeywordNewsReader/1.0)"
@@ -46,10 +47,21 @@ LOG_RETENTION_DAYS = 30
 MAX_RETRY_ATTEMPTS = 3
 RETRY_DELAY_SECONDS = 2.0
 STORY_TOKEN_RE = re.compile(r"[가-힣A-Za-z0-9]+")
+# 날짜 표기("19일", "2026년")는 사건을 구분하지 못하므로 비교에서 제외한다.
+DATE_TOKEN_RE = re.compile(r"^\d+[일월년]?$")
 STORY_STOPWORDS = {
     "ai", "개인정보", "개인정보보호", "보호", "관련", "대한", "위한",
-    "시대", "뉴스", "최신", "진행", "개최", "밝혔다", "19일", "18일",
+    "시대", "뉴스", "최신", "진행", "개최", "밝혔다",
 }
+# Bing 피드는 관련도 순으로 12건 남짓만 돌려주므로 Google 피드로 최신 기사를 보충한다.
+DEFAULT_WINDOW_HOURS = 30
+CURATION_MODEL = "claude-opus-5"
+CURATION_MAX_CANDIDATES = 400
+CURATION_DESCRIPTION_LIMIT = 200
+CURATION_MAX_TOKENS = 16_000
+# 뉴스 요청 제한 시간과 별개다. 수백 건을 판단하는 호출은 수 분이 걸릴 수 있다.
+CURATION_TIMEOUT_SECONDS = 300.0
+GOOGLE_TITLE_SUFFIX_RE = re.compile(r"\s+[-–]\s+[^-–]{2,40}$")
 SOURCE_TIERS = (
     (100, ("연합뉴스", "kbs", "mbc", "sbs", "jtbc", "ytn")),
     (95, ("조선일보", "중앙일보", "동아일보", "한겨레", "경향신문", "한국일보")),
@@ -73,11 +85,33 @@ class Article:
 
 
 @dataclass(frozen=True)
+class Story:
+    """같은 사건을 다룬 기사들을 하나로 묶은 보고 단위."""
+
+    section: str
+    headline: str
+    summary: str
+    importance: int
+    representative: Article
+    related: tuple[Article, ...] = ()
+
+    @property
+    def articles(self) -> tuple[Article, ...]:
+        return (self.representative, *self.related)
+
+
+@dataclass(frozen=True)
 class KakaoConfig:
     rest_api_key: str
     client_secret: str
     refresh_token: str
     link_url: str
+
+
+class PermanentError(RuntimeError):
+    """재시도해도 결과가 달라지지 않는 실패(설정 오류, 거절 등)."""
+
+    retryable = False
 
 
 class TimestampedTee(TextIOBase):
@@ -147,7 +181,8 @@ def retry_operation(
                 print(f"[재시도 성공] {name}: {attempt}/{attempts}회차")
             return result
         except RuntimeError as exc:
-            if attempt >= attempts:
+            # 설정 오류처럼 다시 시도해도 같은 결과가 나오는 실패는 즉시 포기한다.
+            if attempt >= attempts or not getattr(exc, "retryable", True):
                 print(
                     f"[최종 실패] {name}: {attempt}/{attempts}회차 - {exc}",
                     file=sys.stderr,
@@ -346,19 +381,8 @@ def post_kakao_form(
     return result
 
 
-def fetch_news(
-    keyword: str, timeout: float = 10.0, max_results: int = 20
-) -> list[Article]:
-    """무료 Bing News 검색 피드에서 키워드에 해당하는 뉴스를 가져온다."""
-    params = urlencode(
-        {
-            "q": keyword,
-            "format": "rss",
-            "setlang": "ko-kr",
-            "cc": "KR",
-        }
-    )
-    url = f"{BING_NEWS_URL}?{params}"
+def read_feed(url: str, timeout: float) -> ElementTree.Element:
+    """RSS 피드를 받아 파싱한 루트 엘리먼트를 반환한다."""
     request = Request(url, headers={"User-Agent": USER_AGENT})
 
     raw_data: bytes
@@ -377,15 +401,31 @@ def fetch_news(
         raise RuntimeError("뉴스 요청 시간이 초과되었습니다.") from exc
 
     try:
-        root = ElementTree.fromstring(raw_data)
+        return ElementTree.fromstring(raw_data)
     except ElementTree.ParseError as exc:
         raise RuntimeError("뉴스 응답을 해석할 수 없습니다.") from exc
+
+
+def fetch_bing_news(
+    keyword: str, timeout: float = 10.0, max_results: int = 20
+) -> list[Article]:
+    """Bing News 피드에서 키워드 뉴스를 최신순으로 가져온다."""
+    params = urlencode(
+        {
+            "q": keyword,
+            "format": "rss",
+            "setlang": "ko-kr",
+            "cc": "KR",
+            # 기본 정렬은 관련도순이라 몇 달 전 기사가 섞인다. 날짜순으로 강제한다.
+            "qft": 'sortbydate="1"',
+        }
+    )
+    root = read_feed(f"{BING_NEWS_URL}?{params}", timeout)
 
     articles: list[Article] = []
     for item in root.findall("./channel/item")[:max_results]:
         title = clean_text(item.findtext("title"))
         link = normalize_news_link((item.findtext("link") or "").strip())
-        description = clean_text(item.findtext("description"))
         source = ""
         for child in item:
             if child.tag.endswith("Source"):
@@ -398,10 +438,92 @@ def fetch_news(
                     link=link,
                     source=source or "출처 미상",
                     published=parse_date(item.findtext("pubDate")),
-                    description=description,
+                    description=clean_text(item.findtext("description")),
                 )
             )
     return articles
+
+
+def strip_source_suffix(title: str, source: str) -> str:
+    """Google 피드가 제목 끝에 붙이는 " - 언론사" 표기를 제거한다."""
+    if source and title.endswith(f" - {source}"):
+        return title[: -len(source) - 3].strip()
+    return GOOGLE_TITLE_SUFFIX_RE.sub("", title).strip() or title
+
+
+def fetch_google_news(
+    keyword: str,
+    timeout: float = 10.0,
+    max_results: int = 100,
+    window_hours: int = DEFAULT_WINDOW_HOURS,
+) -> list[Article]:
+    """Google News 피드에서 지정한 시간 창 안의 키워드 뉴스를 가져온다."""
+    # when:2d 처럼 일 단위만 받으므로 시간 창을 올림해서 넘긴다.
+    days = max(1, -(-window_hours // 24))
+    params = urlencode(
+        {
+            "q": f"{keyword} when:{days}d",
+            "hl": "ko",
+            "gl": "KR",
+            "ceid": "KR:ko",
+        }
+    )
+    root = read_feed(f"{GOOGLE_NEWS_URL}?{params}", timeout)
+
+    articles: list[Article] = []
+    for item in root.findall("./channel/item")[:max_results]:
+        raw_title = clean_text(item.findtext("title"))
+        link = (item.findtext("link") or "").strip()
+        source = clean_text(item.findtext("source")) or "출처 미상"
+        title = strip_source_suffix(raw_title, source)
+        if title and link:
+            articles.append(
+                Article(
+                    title=title,
+                    link=link,
+                    source=source,
+                    published=parse_date(item.findtext("pubDate")),
+                    # Google 피드의 description은 링크 앵커뿐이라 요약으로 쓸 수 없다.
+                    description="",
+                )
+            )
+    return articles
+
+
+def fetch_news(
+    keyword: str,
+    timeout: float = 10.0,
+    max_results: int = 20,
+    window_hours: int = DEFAULT_WINDOW_HOURS,
+) -> list[Article]:
+    """모든 소스에서 키워드 뉴스를 모은다. 전부 실패할 때만 오류를 낸다."""
+    collected: list[Article] = []
+    failures: list[str] = []
+    sources: list[tuple[str, Callable[[], list[Article]]]] = [
+        (
+            "Google",
+            lambda: fetch_google_news(
+                keyword, timeout=timeout, window_hours=window_hours
+            ),
+        ),
+        (
+            "Bing",
+            lambda: fetch_bing_news(keyword, timeout=timeout, max_results=max_results),
+        ),
+    ]
+    for name, fetcher in sources:
+        try:
+            found = fetcher()
+        except RuntimeError as exc:
+            failures.append(f"{name}: {exc}")
+            print(f"[소스 실패] {keyword} / {name}: {exc}", file=sys.stderr)
+            continue
+        print(f"[소스] {keyword} / {name}: {len(found)}건")
+        collected.extend(found)
+
+    if failures and not collected:
+        raise RuntimeError(f"모든 뉴스 소스가 실패했습니다 ({'; '.join(failures)})")
+    return collected
 
 
 def summarize(article: Article, max_length: int = 180) -> str:
@@ -425,16 +547,37 @@ def summarize(article: Article, max_length: int = 180) -> str:
     return summary
 
 
-def unique_articles(articles: Iterable[Article]) -> list[Article]:
-    """같은 링크나 제목의 중복 기사를 제거한다."""
-    result: list[Article] = []
-    seen: set[str] = set()
+def merge_duplicate_articles(articles: Iterable[Article]) -> list[Article]:
+    """같은 링크나 제목의 기사를 하나로 합치고 정보가 가장 많은 쪽을 남긴다.
+
+    소스마다 같은 기사를 다른 링크로 돌려주고 설명을 붙이는 쪽도 다르므로,
+    합칠 때 설명이 있는 기사를 우선해서 요약 재료를 잃지 않는다.
+    """
+    groups: list[list[Article]] = []
+    index: dict[str, int] = {}
     for article in articles:
-        key = article.link or article.title.casefold()
-        if key not in seen:
-            seen.add(key)
-            result.append(article)
-    return result
+        keys = (
+            f"link:{article.link}",
+            f"title:{SPACE_RE.sub(' ', article.title).strip().casefold()}",
+        )
+        target = next((index[key] for key in keys if key in index), None)
+        if target is None:
+            target = len(groups)
+            groups.append([])
+        groups[target].append(article)
+        for key in keys:
+            index.setdefault(key, target)
+
+    return [
+        max(
+            group,
+            key=lambda item: (
+                len(clean_text(item.description)),
+                representative_score(item),
+            ),
+        )
+        for group in groups
+    ]
 
 
 def article_keys(article: Article) -> set[str]:
@@ -466,7 +609,9 @@ def story_tokens(value: str) -> set[str]:
     return {
         token.casefold()
         for token in STORY_TOKEN_RE.findall(clean_text(value))
-        if len(token) >= 2 and token.casefold() not in STORY_STOPWORDS
+        if len(token) >= 2
+        and token.casefold() not in STORY_STOPWORDS
+        and not DATE_TOKEN_RE.match(token)
     }
 
 
@@ -516,8 +661,8 @@ def representative_score(article: Article) -> tuple[int, int, float]:
     return credibility, information, published.timestamp()
 
 
-def deduplicate_stories(articles: Iterable[Article]) -> list[Article]:
-    """동일 사건 기사들을 묶고 각 사건에서 가장 신뢰도 높은 대표 기사만 남긴다."""
+def cluster_stories(articles: Iterable[Article]) -> list[list[Article]]:
+    """제목·본문 유사도로 같은 사건을 다룬 기사들을 묶는다."""
     clusters: list[list[Article]] = []
     for article in articles:
         for cluster in clusters:
@@ -526,72 +671,350 @@ def deduplicate_stories(articles: Iterable[Article]) -> list[Article]:
                 break
         else:
             clusters.append([article])
-    return [max(cluster, key=representative_score) for cluster in clusters]
+    return clusters
 
 
-def today_start_utc(now: datetime | None = None) -> datetime:
-    """현재 KST 날짜의 시작 시각을 UTC로 반환한다."""
-    current = now or datetime.now(timezone.utc)
-    if current.tzinfo is None:
-        current = current.replace(tzinfo=timezone.utc)
-    today = current.astimezone(KST)
-    return today.replace(hour=0, minute=0, second=0, microsecond=0).astimezone(
-        timezone.utc
-    )
-
-
-def select_today_articles(
+def select_recent_articles(
     articles: Iterable[Article],
-    limit: int,
+    window_hours: int = DEFAULT_WINDOW_HOURS,
     excluded_keys: set[str] | None = None,
-    claimed_keys: set[str] | None = None,
-    claimed_articles: list[Article] | None = None,
     now: datetime | None = None,
 ) -> list[Article]:
-    """오늘 게시됐고 아직 사용되지 않은 기사만 최신순으로 선택한다."""
+    """시간 창 안에 있고 아직 보고하지 않은 기사를 최신순으로 모은다."""
     current = now or datetime.now(timezone.utc)
     if current.tzinfo is None:
         current = current.replace(tzinfo=timezone.utc)
     current = current.astimezone(timezone.utc)
-    start = today_start_utc(current)
+    start = current - timedelta(hours=window_hours)
     excluded = excluded_keys or set()
-    claimed = claimed_keys if claimed_keys is not None else set()
-    claimed_stories = claimed_articles if claimed_articles is not None else []
-    candidates: list[Article] = []
-    ordered = sorted(
-        articles,
-        key=lambda item: item.published or datetime.min.replace(tzinfo=timezone.utc),
-        reverse=True,
-    )
-    for article in ordered:
+
+    fresh: list[Article] = []
+    for article in articles:
         if article.published is None:
             continue
         published = article.published.astimezone(timezone.utc)
+        # 발행 시각이 미래로 밀린 피드가 있어 약간의 여유를 둔다.
         if published < start or published > current + timedelta(minutes=10):
             continue
-        keys = article_keys(article)
-        if keys & excluded:
+        if article_keys(article) & excluded:
             continue
-        candidates.append(article)
+        fresh.append(article)
 
-    representatives = deduplicate_stories(candidates)
-    representatives.sort(
+    # 창 안에서만 합친다. 먼저 합치면 창 밖의 사본이 대표로 뽑혀 기사가 통째로 사라진다.
+    candidates = merge_duplicate_articles(fresh)
+    candidates.sort(
         key=lambda item: item.published or datetime.min.replace(tzinfo=timezone.utc),
         reverse=True,
     )
-    selected: list[Article] = []
-    for article in representatives:
-        keys = article_keys(article)
-        if keys & claimed or any(same_story(article, used) for used in claimed_stories):
+    return candidates
+
+
+CURATION_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "sections": {
+            "type": "array",
+            "description": "내용에 맞게 직접 정한 주제 구획. 중요한 구획을 먼저 놓는다.",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "title": {
+                        "type": "string",
+                        "description": "짧은 한국어 명사구 제목. 예: 제재·과징금",
+                    },
+                    "stories": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "headline": {
+                                    "type": "string",
+                                    "description": "사건을 한 줄로 설명하는 한국어 제목",
+                                },
+                                "summary": {
+                                    "type": "string",
+                                    "description": "기사에 실제로 담긴 사실만 담은 두 문장 이내 한국어 요약",
+                                },
+                                "importance": {
+                                    "type": "integer",
+                                    "description": "실무 중요도. 5가 가장 높다.",
+                                    "enum": [1, 2, 3, 4, 5],
+                                },
+                                "representative": {
+                                    "type": "integer",
+                                    "description": "대표로 삼을 후보 기사 번호",
+                                },
+                                "related": {
+                                    "type": "array",
+                                    "description": "같은 사건을 다룬 다른 후보 기사 번호",
+                                    "items": {"type": "integer"},
+                                },
+                            },
+                            "required": [
+                                "headline",
+                                "summary",
+                                "importance",
+                                "representative",
+                                "related",
+                            ],
+                            "additionalProperties": False,
+                        },
+                    },
+                },
+                "required": ["title", "stories"],
+                "additionalProperties": False,
+            },
+        }
+    },
+    "required": ["sections"],
+    "additionalProperties": False,
+}
+
+CURATION_SYSTEM_PROMPT = """\
+당신은 기업 개인정보보호·정보보안 담당자를 위한 뉴스 큐레이터입니다.
+검색 피드에서 모은 후보 기사 목록을 받아, 담당자가 아침에 읽어야 할 것만 골라
+주제별로 정리합니다.
+
+선별 기준:
+- 개인정보 보호나 정보보안 거버넌스 관점에서 실무적 의미가 있는 기사만 남깁니다.
+- 단순 신제품·서비스 출시, 주가·실적, 인사, 수상, 홍보성 보도자료, 검색어만
+  걸린 무관한 기사는 제외합니다. 남길 것이 적으면 적게 남기세요.
+
+사건 묶기:
+- 여러 언론사가 같은 사건을 보도한 경우 하나의 story로 묶고 나머지는 related에 넣습니다.
+- 같은 기관·기업이 등장해도 사건이 다르면(예: 소명 절차와 과징금 처분) 별도 story로 둡니다.
+- 대표 기사는 원 언론사 기사를 고릅니다. MSN 등 재배포 매체나 제목만 있는 기사는 피하고,
+  내용이 구체적인 기사를 대표로 삼습니다.
+
+중요도:
+- 5: 대규모 유출 사고, 과징금·제재 처분, 법령·고시 개정 확정
+- 3~4: 조사 착수, 제도 예고, 주요 기관의 정책 발표, 중대한 취약점 공개
+- 1~2: 행사·공모전, 협약, 일반 동향 소개
+
+구획:
+- 후보 내용에 맞게 3~6개의 구획을 직접 정합니다. 검색 키워드를 그대로 쓰지 마세요.
+- 구획 제목은 짧은 한국어 명사구로 씁니다.
+
+요약:
+- 후보 목록에 실제로 나온 사실만 씁니다. 추측하거나 없는 수치를 만들지 마세요.
+- 제목만 있고 설명이 없는 후보는 제목에서 확인되는 사실만 요약에 씁니다.
+
+번호는 반드시 후보 목록에 있는 번호만 사용하고, 한 기사를 두 story에 넣지 마세요."""
+
+
+def format_candidates(articles: list[Article]) -> str:
+    """후보 기사를 번호가 붙은 한 줄짜리 목록으로 만든다."""
+    lines: list[str] = []
+    for index, article in enumerate(articles):
+        published = (
+            article.published.astimezone(KST).strftime("%m-%d %H:%M")
+            if article.published
+            else "시각 미상"
+        )
+        parts = [f"[{index}]", article.title, f"| {article.source} | {published}"]
+        description = clean_text(article.description)
+        if description and description != article.title:
+            parts.append(f"| {description[:CURATION_DESCRIPTION_LIMIT]}")
+        lines.append(" ".join(parts))
+    return "\n".join(lines)
+
+
+def build_stories(
+    payload: dict[str, object], articles: list[Article], limit: int
+) -> list[Story]:
+    """모델이 돌려준 구획 정보를 검증해 Story 목록으로 바꾼다."""
+    sections = payload.get("sections")
+    if not isinstance(sections, list):
+        raise RuntimeError("큐레이션 응답에 sections가 없습니다.")
+
+    stories: list[Story] = []
+    used: set[int] = set()
+    for section in sections:
+        if not isinstance(section, dict):
             continue
-        selected.append(article)
-        for candidate in candidates:
-            if same_story(article, candidate):
-                claimed.update(article_keys(candidate))
-        claimed_stories.append(article)
-        if len(selected) >= limit:
-            break
-    return selected
+        title = clean_text(str(section.get("title", ""))) or "기타"
+        entries = section.get("stories")
+        if not isinstance(entries, list):
+            continue
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            index = entry.get("representative")
+            if not isinstance(index, int) or not 0 <= index < len(articles):
+                continue
+            if index in used:
+                continue
+            related_indexes = [
+                value
+                for value in entry.get("related", [])
+                if isinstance(value, int)
+                and 0 <= value < len(articles)
+                and value != index
+                and value not in used
+            ]
+            used.add(index)
+            used.update(related_indexes)
+            importance = entry.get("importance")
+            stories.append(
+                Story(
+                    section=title,
+                    headline=clean_text(str(entry.get("headline", "")))
+                    or articles[index].title,
+                    summary=clean_text(str(entry.get("summary", ""))),
+                    importance=importance if isinstance(importance, int) else 3,
+                    representative=articles[index],
+                    related=tuple(articles[value] for value in related_indexes),
+                )
+            )
+
+    if not stories:
+        raise RuntimeError("큐레이션 결과에서 유효한 기사를 찾지 못했습니다.")
+    stories.sort(key=lambda story: story.importance, reverse=True)
+    return stories[:limit]
+
+
+def curate_with_claude(
+    articles: list[Article],
+    limit: int,
+    api_key: str,
+    timeout: float = CURATION_TIMEOUT_SECONDS,
+    model: str = CURATION_MODEL,
+) -> list[Story]:
+    """Claude로 후보 기사를 선별·묶고 주제별로 정리한다."""
+    try:
+        import anthropic
+    except ImportError as exc:
+        raise RuntimeError(
+            "anthropic 패키지가 없습니다. pip install anthropic으로 설치하세요."
+        ) from exc
+
+    candidates = articles[:CURATION_MAX_CANDIDATES]
+    if len(articles) > CURATION_MAX_CANDIDATES:
+        print(
+            f"[큐레이션] 후보가 많아 최신 {CURATION_MAX_CANDIDATES}건만 넘깁니다"
+            f"(전체 {len(articles)}건).",
+            file=sys.stderr,
+        )
+
+    # api_key를 직접 넘기면 SDK의 자격증명 체인이 건너뛰어져
+    # ANTHROPIC_WORKSPACE_ID가 헤더에 붙지 않으므로 직접 지정한다.
+    workspace_id = get_anthropic_workspace_id()
+    headers = {"anthropic-workspace-id": workspace_id} if workspace_id else {}
+    # retry_operation이 바깥에서 한 번 더 감싸므로 SDK 재시도는 1회로 둔다.
+    client = anthropic.Anthropic(
+        api_key=api_key,
+        timeout=timeout,
+        max_retries=1,
+        default_headers=headers,
+    )
+    prompt = (
+        f"후보 기사 {len(candidates)}건입니다. "
+        f"이 가운데 보고할 만한 사건을 최대 {limit}개까지 골라 정리하세요.\n\n"
+        f"{format_candidates(candidates)}"
+    )
+    try:
+        with client.messages.stream(
+            model=model,
+            max_tokens=CURATION_MAX_TOKENS,
+            system=CURATION_SYSTEM_PROMPT,
+            thinking={"type": "adaptive"},
+            output_config={
+                "format": {"type": "json_schema", "schema": CURATION_SCHEMA}
+            },
+            messages=[{"role": "user", "content": prompt}],
+        ) as stream:
+            response = stream.get_final_message()
+    except anthropic.APIStatusError as exc:
+        message = f"Claude API {exc.status_code} 오류: {exc.message}"
+        # 429와 5xx는 잠시 뒤 성공할 수 있지만, 나머지 4xx는 요청·설정 자체의 문제다.
+        if exc.status_code == 429 or exc.status_code >= 500:
+            raise RuntimeError(message) from exc
+        raise PermanentError(message) from exc
+    except anthropic.APIConnectionError as exc:
+        raise RuntimeError(f"Claude API에 연결할 수 없습니다: {exc}") from exc
+
+    if response.stop_reason == "refusal":
+        raise PermanentError("Claude가 큐레이션 요청을 거절했습니다.")
+    usage = response.usage
+    print(
+        f"[큐레이션] 모델 {model} · 입력 {usage.input_tokens:,} 토큰 · "
+        f"출력 {usage.output_tokens:,} 토큰"
+    )
+
+    text = next((block.text for block in response.content if block.type == "text"), "")
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("큐레이션 응답이 JSON이 아닙니다.") from exc
+    if not isinstance(payload, dict):
+        raise RuntimeError("큐레이션 응답 형식이 올바르지 않습니다.")
+    return build_stories(payload, candidates, limit)
+
+
+def curate_heuristically(articles: list[Article], limit: int) -> list[Story]:
+    """Claude를 쓸 수 없을 때 기존 휴리스틱으로 사건을 묶는다."""
+    stories: list[Story] = []
+    for cluster in cluster_stories(articles):
+        representative = max(cluster, key=representative_score)
+        related = tuple(item for item in cluster if item is not representative)
+        stories.append(
+            Story(
+                section="수집 기사",
+                headline=representative.title,
+                summary=summarize(representative, max_length=200),
+                importance=3,
+                representative=representative,
+                related=related,
+            )
+        )
+
+    stories.sort(
+        key=lambda story: story.representative.published
+        or datetime.min.replace(tzinfo=timezone.utc),
+        reverse=True,
+    )
+    return stories[:limit]
+
+
+def curate(
+    articles: list[Article],
+    limit: int,
+    api_key: str | None,
+) -> list[Story]:
+    """Claude 큐레이션을 시도하고 실패하면 휴리스틱으로 되돌린다."""
+    if not articles:
+        return []
+    if not api_key:
+        print("[큐레이션] API 키가 없어 휴리스틱으로 정리합니다.", file=sys.stderr)
+        return curate_heuristically(articles, limit)
+    try:
+        return retry_operation(
+            "Claude 큐레이션",
+            lambda: curate_with_claude(articles, limit, api_key),
+            attempts=2,
+        )
+    except RuntimeError as exc:
+        print(
+            f"[큐레이션] Claude 정리에 실패해 휴리스틱으로 대체합니다: {exc}",
+            file=sys.stderr,
+        )
+        return curate_heuristically(articles, limit)
+
+
+def group_sections(stories: Iterable[Story]) -> dict[str, list[Story]]:
+    """Story를 구획별로 묶는다. 구획 순서는 최고 중요도 순이다."""
+    grouped: dict[str, list[Story]] = {}
+    for story in stories:
+        grouped.setdefault(story.section, []).append(story)
+    for entries in grouped.values():
+        entries.sort(key=lambda story: story.importance, reverse=True)
+    return dict(
+        sorted(
+            grouped.items(),
+            key=lambda item: max(story.importance for story in item[1]),
+            reverse=True,
+        )
+    )
 
 
 def history_path() -> Path:
@@ -652,53 +1075,71 @@ def format_date(value: datetime | None) -> str:
     return korea_time.strftime("%Y-%m-%d %H:%M KST")
 
 
-def display_topic(keyword: str, articles: list[Article], limit: int) -> None:
-    print(f"\n{'=' * 72}\n주제: {keyword} ({min(len(articles), limit)}건)\n{'=' * 72}")
-    if not articles:
-        print("검색된 뉴스가 없습니다.")
+def story_summary(story: Story, max_length: int = 200) -> str:
+    """큐레이션 요약이 없으면 원문 설명에서 뽑아 쓴다."""
+    if story.summary:
+        return story.summary[:max_length]
+    return summarize(story.representative, max_length=max_length)
+
+
+def display_sections(sections: dict[str, list[Story]]) -> None:
+    if not sections:
+        print("\n보고할 새 뉴스가 없습니다.")
         return
 
-    for number, article in enumerate(articles[:limit], start=1):
-        print(f"\n{number}. {article.title}")
-        print(f"   출처: {article.source} | {format_date(article.published)}")
-        print(f"   요약: {summarize(article)}")
-        print(f"   링크: {article.link}")
+    for title, stories in sections.items():
+        print(f"\n{'=' * 72}\n{title} ({len(stories)}건)\n{'=' * 72}")
+        for number, story in enumerate(stories, start=1):
+            article = story.representative
+            print(f"\n{number}. [중요도 {story.importance}] {story.headline}")
+            print(f"   출처: {article.source} | {format_date(article.published)}")
+            print(f"   요약: {story_summary(story)}")
+            print(f"   링크: {article.link}")
+            if story.related:
+                names = ", ".join(item.source for item in story.related)
+                print(f"   관련 보도 {len(story.related)}건: {names}")
 
 
-def build_teams_message(topics: dict[str, list[Article]]) -> dict[str, str]:
-    """모든 주제를 Teams 일반 메시지용 HTML 본문 하나로 만든다."""
-    collected_at = datetime.now(timezone(timedelta(hours=9))).strftime(
-        "%Y-%m-%d %H:%M KST"
-    )
+def build_teams_message(sections: dict[str, list[Story]]) -> dict[str, str]:
+    """큐레이션한 구획 전체를 Teams 일반 메시지용 HTML 본문 하나로 만든다."""
+    collected_at = datetime.now(KST).strftime("%Y-%m-%d %H:%M KST")
+    total = sum(len(stories) for stories in sections.values())
     lines = [
-        "<h2>📰 오늘 새로 확인된 개인정보 보호 · AI 보안 뉴스</h2>",
-        f"<p><em>수집 시각: {html.escape(collected_at)}</em></p>",
+        "<h2>📰 개인정보 보호 · AI 보안 뉴스 브리핑</h2>",
+        f"<p><em>수집 시각: {html.escape(collected_at)} · 새 사건 {total}건</em></p>",
     ]
-    for keyword, articles in topics.items():
+    if not sections:
+        lines.append("<p>보고할 새 뉴스가 없습니다.</p>")
+        return {"text": "".join(lines)}
+
+    for title, stories in sections.items():
         lines.extend(
             [
                 "<hr>",
-                f"<h3>{html.escape(keyword)} ({len(articles)}건)</h3>",
+                f"<h3>{html.escape(title)} ({len(stories)}건)</h3>",
+                "<ol>",
             ]
         )
-        if not articles:
-            lines.append("<p>검색된 뉴스가 없습니다.</p>")
-            continue
-
-        lines.append("<ol>")
-        for article in articles:
-            title = html.escape(article.title)
+        for story in stories:
+            article = story.representative
+            headline = html.escape(story.headline)
             link = html.escape(article.link, quote=True)
             source = html.escape(article.source)
             published = html.escape(format_date(article.published))
-            summary = html.escape(summarize(article, max_length=140))
-            lines.append(
-                "<li>"
-                f'<strong><a href="{link}">{title}</a></strong><br>'
-                f"<small>{source} · {published}</small><br>"
-                f"{summary}"
-                "</li>"
-            )
+            summary = html.escape(story_summary(story, max_length=160))
+            entry = [
+                "<li>",
+                f'<strong><a href="{link}">{headline}</a></strong><br>',
+                f"<small>{source} · {published} · 중요도 {story.importance}</small><br>",
+                summary,
+            ]
+            if story.related:
+                names = html.escape(
+                    ", ".join(item.source for item in story.related[:4])
+                )
+                entry.append(f"<br><small>관련 보도: {names}</small>")
+            entry.append("</li>")
+            lines.append("".join(entry))
         lines.append("</ol>")
 
     return {"text": "".join(lines)}
@@ -706,12 +1147,12 @@ def build_teams_message(topics: dict[str, list[Article]]) -> dict[str, str]:
 
 def send_to_teams(
     webhook_url: str,
-    topics: dict[str, list[Article]],
+    sections: dict[str, list[Story]],
     timeout: float,
 ) -> None:
-    """모든 키워드의 뉴스가 담긴 일반 메시지 하나를 Teams로 전송한다."""
+    """큐레이션한 뉴스가 담긴 일반 메시지 하나를 Teams로 전송한다."""
     data = json.dumps(
-        build_teams_message(topics), ensure_ascii=False
+        build_teams_message(sections), ensure_ascii=False
     ).encode("utf-8")
     if len(data) > TEAMS_MAX_PAYLOAD_BYTES:
         raise RuntimeError(
@@ -795,6 +1236,15 @@ def get_teams_webhook_url() -> str | None:
     return get_user_setting("TEAMS_WEBHOOK_URL")
 
 
+def get_anthropic_api_key() -> str | None:
+    return get_user_setting("ANTHROPIC_API_KEY")
+
+
+def get_anthropic_workspace_id() -> str | None:
+    """조직 계정의 identity-linked 키는 워크스페이스 ID를 함께 보내야 한다."""
+    return get_user_setting("ANTHROPIC_WORKSPACE_ID")
+
+
 def get_kakao_config() -> KakaoConfig | None:
     names = {
         "rest_api_key": "KAKAO_REST_API_KEY",
@@ -837,15 +1287,13 @@ def refresh_kakao_access_token(config: KakaoConfig, timeout: float) -> str:
     return access_token
 
 
-def build_kakao_text(topics: dict[str, list[Article]]) -> str:
+def build_kakao_text(sections: dict[str, list[Story]]) -> str:
     """HTML 뉴스 보고서를 안내하는 카카오 메시지를 만든다."""
-    collected_at = datetime.now(timezone(timedelta(hours=9))).strftime(
-        "%Y-%m-%d %H:%M KST"
-    )
-    article_count = sum(len(articles) for articles in topics.values())
+    collected_at = datetime.now(KST).strftime("%Y-%m-%d %H:%M KST")
+    story_count = sum(len(stories) for stories in sections.values())
     return (
-        "오늘 새로 확인된 개인정보 보호 · AI 보안 뉴스\n"
-        f"중복을 제외한 새 기사 {article_count}건을 정리했습니다.\n"
+        "개인정보 보호 · AI 보안 뉴스 브리핑\n"
+        f"{len(sections)}개 주제에서 새 사건 {story_count}건을 정리했습니다.\n"
         f"업데이트: {collected_at}\n"
         "아래 버튼을 눌러 전체 HTML 보고서를 확인하세요."
     )[:200]
@@ -853,14 +1301,14 @@ def build_kakao_text(topics: dict[str, list[Article]]) -> str:
 
 def send_topics_to_kakao(
     config: KakaoConfig,
-    topics: dict[str, list[Article]],
+    sections: dict[str, list[Story]],
     timeout: float,
 ) -> None:
     """액세스 토큰을 갱신하고 HTML 보고서 링크를 한 번만 보낸다."""
     access_token = refresh_kakao_access_token(config, timeout)
     template = {
         "object_type": "text",
-        "text": build_kakao_text(topics),
+        "text": build_kakao_text(sections),
         "link": {
             "web_url": config.link_url,
             "mobile_web_url": config.link_url,
@@ -890,14 +1338,25 @@ def build_parser() -> argparse.ArgumentParser:
         "-n",
         "--limit",
         type=int,
-        default=5,
-        help="주제별로 표시할 기사 수 (기본값: 5)",
+        default=12,
+        help="보고서 전체에 담을 사건 수 (기본값: 12)",
     )
     parser.add_argument(
         "--timeout",
         type=float,
         default=10.0,
         help="뉴스 요청 제한 시간(초, 기본값: 10)",
+    )
+    parser.add_argument(
+        "--window-hours",
+        type=int,
+        default=DEFAULT_WINDOW_HOURS,
+        help=f"이 시간 안에 게시된 기사만 후보로 씁니다 (기본값: {DEFAULT_WINDOW_HOURS})",
+    )
+    parser.add_argument(
+        "--no-claude",
+        action="store_true",
+        help="Claude 큐레이션을 건너뛰고 휴리스틱으로만 정리합니다.",
     )
     parser.add_argument(
         "--interval",
@@ -924,76 +1383,111 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def collect_candidates(
+    keywords: list[str],
+    timeout: float,
+    window_hours: int,
+    excluded_keys: set[str],
+) -> tuple[list[Article], int]:
+    """모든 키워드의 후보 기사를 하나의 풀로 모은다. 반환값은 (후보, 실패 키워드 수)."""
+    pool: list[Article] = []
+    failures = 0
+    for keyword in keywords:
+        print(f"[수집] {keyword}")
+        try:
+            pool.extend(
+                retry_operation(
+                    f"뉴스 수집({keyword})",
+                    lambda keyword=keyword: fetch_news(
+                        keyword, timeout=timeout, window_hours=window_hours
+                    ),
+                )
+            )
+        except RuntimeError as exc:
+            failures += 1
+            print(f"[경고] {keyword}: {exc}", file=sys.stderr)
+
+    candidates = select_recent_articles(
+        pool, window_hours=window_hours, excluded_keys=excluded_keys
+    )
+    print(
+        f"[후보] 수집 {len(pool)}건 → 최근 {window_hours}시간 내 신규 {len(candidates)}건"
+    )
+    return candidates, failures
+
+
+def build_report(
+    keywords: list[str],
+    limit: int,
+    timeout: float,
+    window_hours: int,
+    api_key: str | None,
+    excluded_keys: set[str] | None = None,
+) -> tuple[dict[str, list[Story]], int]:
+    """후보를 모아 큐레이션한 구획을 만든다. 반환값은 (구획, 실패 키워드 수)."""
+    candidates, failures = collect_candidates(
+        keywords, timeout, window_hours, excluded_keys or set()
+    )
+    stories = curate(candidates, limit, api_key)
+    sections = group_sections(stories)
+    print(f"[정리] 구획 {len(sections)}개 · 사건 {len(stories)}건")
+    return sections, failures
+
+
 def run_news_cycle(
     keywords: list[str],
     limit: int,
     timeout: float,
+    window_hours: int,
     webhook_url: str | None,
     kakao_config: KakaoConfig | None,
+    api_key: str | None,
 ) -> int:
-    """뉴스 수집과 콘솔 출력 및 Teams 전송을 한 차례 수행한다."""
-    print(f"{', '.join(keywords)} 주제의 오늘 새 뉴스를 가져오는 중입니다...")
-    failures = 0
-    topics: dict[str, list[Article]] = {}
+    """뉴스 수집·큐레이션과 콘솔 출력 및 Teams 전송을 한 차례 수행한다."""
+    print(f"{', '.join(keywords)} 주제의 새 뉴스를 가져오는 중입니다...")
     history = load_sent_history()
-    claimed_keys: set[str] = set()
-    claimed_articles: list[Article] = []
-    for keyword in keywords:
-        try:
-            articles = unique_articles(
-                retry_operation(
-                    f"뉴스 수집({keyword})",
-                    lambda: fetch_news(
-                        keyword,
-                        timeout=timeout,
-                        max_results=max(limit * 6, 30),
-                    ),
-                )
-            )
-            selected = select_today_articles(
-                articles,
-                limit,
-                excluded_keys=set(history),
-                claimed_keys=claimed_keys,
-                claimed_articles=claimed_articles,
-            )
-            topics[keyword] = selected
-            display_topic(keyword, selected, limit)
-        except RuntimeError as exc:
-            failures += 1
-            print(f"\n[주제: {keyword}] 처리 실패: {exc}", file=sys.stderr)
+    sections, failures = build_report(
+        keywords, limit, timeout, window_hours, api_key, set(history)
+    )
+    display_sections(sections)
 
-    if webhook_url and topics:
+    reported_keys: set[str] = set()
+    for stories in sections.values():
+        for story in stories:
+            for article in story.articles:
+                reported_keys.update(article_keys(article))
+
+    if webhook_url and sections:
         try:
             retry_operation(
                 "Teams 전송",
-                lambda: send_to_teams(webhook_url, topics, timeout),
+                lambda: send_to_teams(webhook_url, sections, timeout),
             )
-            print(f"[Teams] {len(topics)}개 주제를 본문 하나로 전송 완료")
+            print(f"[Teams] {len(sections)}개 구획을 본문 하나로 전송 완료")
         except RuntimeError as exc:
             print(f"\n[Teams] 전송 실패: {exc}", file=sys.stderr)
             return 1
 
-    if kakao_config and topics:
+    if kakao_config and sections:
         try:
             retry_operation(
                 "카카오톡 전송",
-                lambda: send_topics_to_kakao(kakao_config, topics, timeout),
+                lambda: send_topics_to_kakao(kakao_config, sections, timeout),
             )
             print("[KakaoTalk] HTML 뉴스 보고서 링크 전송 완료")
         except RuntimeError as exc:
             print(f"\n[KakaoTalk] 전송 실패: {exc}", file=sys.stderr)
             return 1
 
-    if claimed_keys and (webhook_url or kakao_config):
+    if reported_keys and (webhook_url or kakao_config):
         try:
-            save_sent_history(history, claimed_keys)
-            print(f"[이력] 새 기사 {len(claimed_keys)}개 식별값 저장 완료")
+            save_sent_history(history, reported_keys)
+            print(f"[이력] 보고한 기사 {len(reported_keys)}개 식별값 저장 완료")
         except OSError as exc:
             print(f"\n[이력] 저장 실패: {exc}", file=sys.stderr)
             return 1
 
-    return 1 if failures == len(keywords) else 0
+    return 1 if keywords and failures == len(keywords) else 0
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1007,8 +1501,17 @@ def main(argv: list[str] | None = None) -> int:
     if args.interval < 0:
         print("오류: 반복 간격은 0 이상이어야 합니다.", file=sys.stderr)
         return 2
+    if args.window_hours < 1:
+        print("오류: 시간 창은 1 이상이어야 합니다.", file=sys.stderr)
+        return 2
 
     keywords = parse_keywords(args.keywords) or DEFAULT_KEYWORDS.copy()
+    api_key = None if args.no_claude else get_anthropic_api_key()
+    if not args.no_claude and not api_key:
+        print(
+            "안내: ANTHROPIC_API_KEY가 없어 휴리스틱 정리로 실행합니다.",
+            file=sys.stderr,
+        )
     webhook_url = None if args.no_teams else get_teams_webhook_url()
     if not webhook_url and not args.no_teams:
         print(
@@ -1035,8 +1538,10 @@ def main(argv: list[str] | None = None) -> int:
             keywords,
             args.limit,
             args.timeout,
+            args.window_hours,
             webhook_url,
             kakao_config,
+            api_key,
         )
         if args.interval == 0:
             return result
