@@ -2,7 +2,7 @@ name: Update News Report
 
 on:
   workflow_dispatch:
-  # 코드를 고치면 바로 반영한다. 이게 없으면 다음 예약 실행까지 낡은 페이지가 남는다.
+  # 코드를 고치면 페이지를 바로 반영한다. 브리핑은 보내지 않는다.
   push:
     branches: [main]
   schedule:
@@ -10,7 +10,8 @@ on:
     - cron: "40 23 * * *"
 
 permissions:
-  contents: read
+  # 전송 이력을 리포에 커밋해 실행 사이에 이어간다.
+  contents: write
   pages: write
   id-token: write
 
@@ -25,6 +26,10 @@ jobs:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
 
+    env:
+      # 실행 사이에 이어갈 전송 이력. 이 파일이 있어야 같은 기사를 두 번 보내지 않는다.
+      NEWS_HISTORY_FILE: data/sent_articles.json
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -38,13 +43,34 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Generate report
-        # 키가 없으면 Claude 큐레이션을 건너뛰고 휴리스틱으로 생성된다.
-        # ANTHROPIC_WORKSPACE_ID는 조직의 identity-linked 키를 쓸 때만 필요하다.
+      # 예약 실행과 수동 실행만 브리핑을 보낸다. 커밋마다 채널에 알림이
+      # 가면 안 되므로 push로 돌 때는 페이지만 다시 만든다.
+      - name: Generate report and send briefing
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           ANTHROPIC_WORKSPACE_ID: ${{ secrets.ANTHROPIC_WORKSPACE_ID }}
-        run: python generate_site.py --output site/index.html
+          TEAMS_WEBHOOK_URL: ${{ secrets.TEAMS_WEBHOOK_URL }}
+        run: |
+          if [ "${{ github.event_name }}" = "push" ]; then
+            python app.py --site site/index.html --no-teams -n 30
+          else
+            python app.py --site site/index.html -n 30
+          fi
+
+      - name: Commit sent history
+        run: |
+          # 아직 추적되지 않는 첫 실행도 잡아야 하므로 diff가 아닌 status로 본다.
+          if [ -z "$(git status --porcelain -- "$NEWS_HISTORY_FILE")" ]; then
+            echo "이력에 변화가 없어 커밋을 건너뜁니다."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add "$NEWS_HISTORY_FILE"
+          git commit -m "Record briefed articles [skip ci]"
+          # 다른 실행이 먼저 밀어 넣었을 수 있으니 다시 맞춘 뒤 올린다.
+          git pull --rebase --autostash origin main
+          git push origin HEAD:main
 
       - name: Configure Pages
         uses: actions/configure-pages@v5

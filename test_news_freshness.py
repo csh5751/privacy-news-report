@@ -784,6 +784,106 @@ class RevisitedTests(unittest.TestCase):
         self.assertIn("이미 안내한 사건 (1건)", text)
 
 
+class PageTests(unittest.TestCase):
+    def setUp(self):
+        import generate_site
+
+        self.site = generate_site
+        self.now = datetime(2026, 9, 3, 1, 0, tzinfo=timezone.utc)
+        self.story = app.Story(
+            section="개인정보 유출 사고",
+            headline="티빙, 개인정보 유출 공식 사과",
+            summary="사과했다.",
+            importance=5,
+            representative=article("티빙 사과", "https://a.test/new", self.now, "한국일보"),
+        )
+        self.old = app.Story(
+            section="",
+            headline="이미 안내한 사건",
+            summary="",
+            importance=4,
+            representative=article("이미 안내", "https://a.test/old", self.now, "연합뉴스"),
+            related=(article("이미 안내 2", "https://a.test/old2", self.now, "중앙일보"),),
+        )
+
+    def page(self, **kwargs) -> str:
+        return self.site.build_page(
+            {"개인정보 유출 사고": [self.story]}, self.now, **kwargs
+        )
+
+    def test_page_lists_already_reported_stories_last_and_collapsed(self):
+        page = self.page(revisited=(self.old,), revisited_hidden=50)
+
+        self.assertIn("이미 안내한 사건", page)
+        self.assertIn("보도 2건", page)
+        self.assertIn("이 밖에 사건 50건", page)
+        # 새 사건 구획보다 뒤에 오고, 기본으로 접혀 있어야 한다.
+        self.assertLess(page.index("개인정보 유출 사고"), page.index("이미 안내한 사건"))
+        self.assertIn('class="topic seen"', page)
+        self.assertNotIn('class="topic seen" open', page)
+
+    def test_page_omits_the_section_when_nothing_was_held_back(self):
+        self.assertNotIn("이미 안내한 사건", self.page())
+
+    def test_page_omits_the_remainder_line_when_all_fit(self):
+        page = self.page(revisited=(self.old,), revisited_hidden=0)
+
+        self.assertIn("이미 안내한 사건", page)
+        self.assertNotIn("이 밖에 사건", page)
+
+    def test_page_escapes_titles_and_links(self):
+        nasty = app.Story(
+            section="",
+            headline='<script>alert("x")</script>',
+            summary="",
+            importance=3,
+            representative=article("t", 'https://a.test/?q="x"', self.now, "출처"),
+        )
+
+        page = self.page(revisited=(nasty,))
+
+        self.assertNotIn("<script>alert", page)
+        self.assertNotIn('href="https://a.test/?q="x""', page)
+
+
+class WebhookRequirementTests(unittest.TestCase):
+    def run_main(self, argv: list[str]) -> int:
+        original = app.get_teams_webhook_url
+        app.get_teams_webhook_url = lambda: None
+        # 수집까지 가지 않도록 사이클을 막아 인자 검증만 확인한다.
+        original_cycle = app.run_news_cycle
+        app.run_news_cycle = lambda *a, **k: 0
+        try:
+            return app.main(argv)
+        finally:
+            app.get_teams_webhook_url = original
+            app.run_news_cycle = original_cycle
+
+    def test_missing_webhook_is_fatal_when_teams_is_the_only_output(self):
+        self.assertEqual(2, self.run_main([]))
+
+    def test_missing_webhook_only_warns_when_a_report_is_also_built(self):
+        # 전송 설정이 없다고 페이지 배포까지 막으면 안 된다.
+        self.assertEqual(0, self.run_main(["--site", "site/index.html"]))
+
+
+class HistoryLocationTests(unittest.TestCase):
+    def test_history_path_honours_the_override(self):
+        import os
+
+        original = os.environ.get("NEWS_HISTORY_FILE")
+        os.environ["NEWS_HISTORY_FILE"] = "data/sent_articles.json"
+        try:
+            self.assertEqual(Path("data/sent_articles.json"), app.history_path())
+            # 로그는 리포에 커밋할 것이 아니므로 이력 경로를 따라가지 않는다.
+            self.assertNotIn("data", app.logs_directory().parts)
+        finally:
+            if original is None:
+                del os.environ["NEWS_HISTORY_FILE"]
+            else:
+                os.environ["NEWS_HISTORY_FILE"] = original
+
+
 class NoticeTests(unittest.TestCase):
     def stats(self, **overrides) -> app.RunStats:
         values = {

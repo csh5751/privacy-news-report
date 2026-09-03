@@ -60,15 +60,50 @@ def notice_html(stats: app.RunStats | None) -> str:
     return f'\n      <div class="notice">{lines}</div>'
 
 
+def revisited_html(revisited: tuple[app.Story, ...], hidden: int) -> str:
+    """이미 안내한 사건을 제목만 한 줄씩 붙인다."""
+    if not revisited:
+        return ""
+    items = "".join(
+        "\n          <li>"
+        f'<a href="{html.escape(story.representative.link, quote=True)}" '
+        'target="_blank" rel="noopener noreferrer">'
+        f"{html.escape(story.headline)}</a>"
+        f'<span class="seen-meta">{html.escape(story.representative.source)}'
+        f"<span aria-hidden=\"true\"> · </span>보도 {len(story.articles)}건</span>"
+        "</li>"
+        for story in revisited
+    )
+    more = (
+        f'\n        <p class="empty">이 밖에 사건 {hidden}건이 더 있습니다.</p>'
+        if hidden > 0
+        else ""
+    )
+    return f"""
+    <details class="topic seen">
+      <summary>
+        <span>이미 안내한 사건</span>
+        <span class="count">{len(revisited)}건</span>
+      </summary>
+      <div class="seen-body">
+        <p class="seen-lead">지난 브리핑에서 보낸 사건입니다. 보도가 이어지고 있어 제목만 적었습니다.</p>
+        <ul class="seen-list">{items}
+        </ul>{more}
+      </div>
+    </details>"""
+
+
 def build_page(
     topics: dict[str, list[app.Story]],
     generated_at: datetime,
     stats: app.RunStats | None = None,
+    revisited: tuple[app.Story, ...] = (),
+    revisited_hidden: int = 0,
 ) -> str:
     total = sum(len(stories) for stories in topics.values())
     sections = "".join(
         section_html(title, stories) for title, stories in topics.items()
-    )
+    ) + revisited_html(revisited, revisited_hidden)
     notice = notice_html(stats)
     updated = html.escape(generated_at.astimezone(KST).strftime("%Y년 %m월 %d일 %H:%M KST"))
     return f"""<!doctype html>
@@ -120,6 +155,16 @@ def build_page(
     .related {{ margin: 0 0 13px; color: var(--muted); font-size: .8rem; }}
     .article-link {{ color: var(--accent); font-size: .85rem; font-weight: 600; text-decoration: none; }}
     .empty {{ padding: 24px; color: var(--muted); }}
+    .seen {{ background: transparent; box-shadow: none; border-style: dashed; }}
+    .seen > summary {{ color: var(--muted); font-size: .98rem; font-weight: 600; }}
+    .seen-body {{ padding: 4px 22px 18px; border-top: 1px solid var(--line); }}
+    .seen-lead {{ margin: 14px 0 10px; color: var(--muted); font-size: .82rem; }}
+    .seen-list {{ margin: 0; padding-left: 18px; }}
+    .seen-list li {{ margin-bottom: 7px; font-size: .9rem; }}
+    .seen-list a {{ color: var(--text); text-decoration: none; }}
+    .seen-list a:hover {{ color: var(--accent); text-decoration: underline; }}
+    .seen-meta {{ display: block; color: var(--muted); font-size: .78rem; }}
+    .seen .empty {{ padding: 10px 0 0; font-size: .82rem; }}
     footer {{ padding: 24px 0 42px; color: var(--muted); text-align: center; font-size: .82rem; }}
     @media (max-width: 720px) {{
       header {{ padding-top: 40px; }} .wrap {{ width: min(100% - 20px, 1120px); }}
@@ -217,7 +262,14 @@ def main(argv: list[str] | None = None) -> int:
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(
-        build_page(sections, datetime.now(timezone.utc), stats), encoding="utf-8"
+        build_page(
+            sections,
+            datetime.now(timezone.utc),
+            stats,
+            report.revisited,
+            report.revisited_hidden,
+        ),
+        encoding="utf-8",
     )
     print(f"[완료] {output.resolve()} ({stats.stories}건)")
     return 1 if keywords and stats.failed_keywords == len(keywords) else 0

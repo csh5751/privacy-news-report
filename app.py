@@ -212,8 +212,14 @@ class TimestampedTee(TextIOBase):
 
 
 def logs_directory() -> Path:
-    """사용자별 실행 로그 디렉터리를 반환한다."""
-    return history_path().parent / "logs"
+    """실행 로그 디렉터리를 반환한다.
+
+    이력 파일과 달리 로그는 리포에 커밋할 것이 아니므로, 이력 경로를
+    옮겨도 항상 사용자 영역에 남긴다.
+    """
+    base = os.environ.get("LOCALAPPDATA")
+    root = Path(base) if base else Path.home() / ".local" / "share"
+    return root / "PrivacyNewsReport" / "logs"
 
 
 def cleanup_old_logs(directory: Path) -> None:
@@ -1255,7 +1261,14 @@ def group_sections(
 
 
 def history_path() -> Path:
-    """전송 이력을 저장할 사용자별 로컬 파일 경로를 반환한다."""
+    """전송 이력 파일 경로를 반환한다.
+
+    NEWS_HISTORY_FILE을 주면 그 경로를 쓴다. CI에서 이력을 리포에 두고
+    실행 사이에 이어가려면 사용자 홈이 아닌 곳을 가리켜야 한다.
+    """
+    override = os.environ.get("NEWS_HISTORY_FILE")
+    if override:
+        return Path(override)
     base = os.environ.get("LOCALAPPDATA")
     root = Path(base) if base else Path.home() / ".local" / "share"
     return root / "PrivacyNewsReport" / "sent_articles.json"
@@ -1710,6 +1723,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Claude 큐레이션을 건너뛰고 휴리스틱으로만 정리합니다.",
     )
     parser.add_argument(
+        "--site",
+        metavar="PATH",
+        help="같은 실행 결과로 HTML 보고서도 만듭니다. 예: site/index.html",
+    )
+    parser.add_argument(
         "--interval",
         type=float,
         default=0,
@@ -1812,6 +1830,28 @@ def build_report(
     )
 
 
+def write_site(report: Report, output: str) -> None:
+    """같은 실행 결과로 HTML 보고서를 만든다.
+
+    generate_site가 app을 가져오므로 순환을 피해 필요할 때만 불러온다.
+    """
+    import generate_site
+
+    path = Path(output)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        generate_site.build_page(
+            report.sections,
+            datetime.now(timezone.utc),
+            report.stats,
+            report.revisited,
+            report.revisited_hidden,
+        ),
+        encoding="utf-8",
+    )
+    print(f"[보고서] {path.resolve()} ({report.total}건)")
+
+
 def run_news_cycle(
     keywords: list[str],
     limit: int,
@@ -1820,6 +1860,7 @@ def run_news_cycle(
     webhook_url: str | None,
     kakao_config: KakaoConfig | None,
     api_key: str | None,
+    site_output: str | None = None,
 ) -> int:
     """뉴스 수집·큐레이션과 콘솔 출력 및 Teams 전송을 한 차례 수행한다."""
     print(f"{', '.join(keywords)} 주제의 새 뉴스를 가져오는 중입니다...")
@@ -1833,6 +1874,15 @@ def run_news_cycle(
     display_revisited(report.revisited)
     for line in notice_lines(stats):
         print(f"[안내] {line}")
+
+    # 보고서는 전송보다 먼저, 전송 결과와 무관하게 만든다. 전송이 실패해도
+    # 페이지는 최신 상태로 남아야 한다.
+    if site_output:
+        try:
+            write_site(report, site_output)
+        except OSError as exc:
+            print(f"\n[보고서] 생성 실패: {exc}", file=sys.stderr)
+            return 1
 
     # 본문에 실린 사건만 이력에 남긴다. 이미 안내한 목록은 다시 기록할 필요가 없다.
     reported_keys: set[str] = set()
@@ -1905,12 +1955,20 @@ def main(argv: list[str] | None = None) -> int:
         )
     webhook_url = None if args.no_teams else get_teams_webhook_url()
     if not webhook_url and not args.no_teams:
-        print(
-            "오류: TEAMS_WEBHOOK_URL이 설정되어 있지 않습니다. "
-            "Teams 전송 없이 실행하려면 --no-teams를 사용하세요.",
-            file=sys.stderr,
-        )
-        return 2
+        if args.site:
+            # 보고서도 만드는 실행이면 전송 설정이 없다고 통째로 멈추지 않는다.
+            # 여기서 죽으면 페이지 배포까지 함께 막힌다.
+            print(
+                "안내: TEAMS_WEBHOOK_URL이 없어 전송을 생략하고 보고서만 만듭니다.",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                "오류: TEAMS_WEBHOOK_URL이 설정되어 있지 않습니다. "
+                "Teams 전송 없이 실행하려면 --no-teams를 사용하세요.",
+                file=sys.stderr,
+            )
+            return 2
     try:
         kakao_config = (
             get_kakao_config() if args.kakao and not args.no_kakao else None
@@ -1933,6 +1991,7 @@ def main(argv: list[str] | None = None) -> int:
             webhook_url,
             kakao_config,
             api_key,
+            args.site,
         )
         if args.interval == 0:
             return result
