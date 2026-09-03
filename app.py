@@ -93,7 +93,12 @@ SOURCE_TIERS = (
     (85, ("전자신문", "아이뉴스24", "zdnet", "지디넷", "디지털데일리", "보안뉴스")),
     (75, ("뉴스1", "뉴시스", "이투데이", "아시아투데이")),
 )
-AGGREGATOR_HOSTS = ("msn.com", "news.nate.com", "zum.com")
+AGGREGATOR_HOSTS = (
+    "msn.com", "nate.com", "zum.com", "daum.net", "news.naver.com",
+)
+# Google 피드는 재배포 매체를 "네이트"처럼 출처명으로만 주기 때문에 호스트만
+# 봐서는 걸러지지 않는다. 이름으로도 판별한다.
+AGGREGATOR_SOURCE_TERMS = ("네이트", "msn", "zum", "줌뉴스", "다음뉴스", "daum")
 # 개인 블로그·카페 글은 언론 보도가 아니므로 후보에서 제외한다.
 UGC_SOURCE_TERMS = ("블로그", "카페", "브런치", "blog", "tistory", "brunch")
 T = TypeVar("T")
@@ -666,6 +671,35 @@ def story_tokens(value: str) -> set[str]:
     }
 
 
+def is_aggregator(article: Article) -> bool:
+    """기사를 실어주기만 하는 재배포 매체인지 판단한다."""
+    hostname = (urlparse(article.link).hostname or "").casefold()
+    if any(
+        hostname == host or hostname.endswith(f".{host}")
+        for host in AGGREGATOR_HOSTS
+    ):
+        return True
+    source = article.source.casefold()
+    return any(term in source for term in AGGREGATOR_SOURCE_TERMS)
+
+
+def prefer_original_outlet(story: Story) -> Story:
+    """대표 기사가 재배포 매체면 같은 사건의 원 언론사 기사로 바꾼다.
+
+    독자가 원문 대신 네이트·MSN 같은 중계 페이지로 이동하는 것을 막는다.
+    """
+    if not is_aggregator(story.representative):
+        return story
+    originals = [item for item in story.related if not is_aggregator(item)]
+    if not originals:
+        return story
+    replacement = max(originals, key=representative_score)
+    remaining = tuple(
+        item for item in story.articles if item is not replacement
+    )
+    return replace(story, representative=replacement, related=remaining)
+
+
 def is_user_generated(article: Article) -> bool:
     """개인 블로그·카페 글인지 판단한다."""
     haystack = f"{article.source} {article.title} {urlparse(article.link).hostname or ''}"
@@ -762,8 +796,7 @@ def representative_score(article: Article) -> tuple[int, int, float]:
             credibility = score
             break
 
-    hostname = (urlparse(article.link).hostname or "").casefold()
-    if any(hostname == host or hostname.endswith(f".{host}") for host in AGGREGATOR_HOSTS):
+    if is_aggregator(article):
         credibility -= 15
     else:
         credibility += 10
@@ -883,8 +916,8 @@ CURATION_SYSTEM_PROMPT = """\
 사건 묶기:
 - 여러 언론사가 같은 사건을 보도한 경우 하나의 story로 묶고 나머지는 related에 넣습니다.
 - 같은 기관·기업이 등장해도 사건이 다르면(예: 소명 절차와 과징금 처분) 별도 story로 둡니다.
-- 대표 기사는 원 언론사 기사를 고릅니다. MSN 등 재배포 매체나 제목만 있는 기사는 피하고,
-  내용이 구체적인 기사를 대표로 삼습니다.
+- 대표 기사는 원 언론사 기사를 고릅니다. 네이트, 다음, MSN처럼 남의 기사를 실어주는
+  매체나 제목만 있는 기사는 피하고, 내용이 구체적인 기사를 대표로 삼습니다.
 
 중요도:
 - 5: 대규모 유출 사고, 과징금·제재 처분, 법령·고시 개정 확정
@@ -945,21 +978,23 @@ def build_stories(
         used.update(related_indexes)
         importance = entry.get("importance")
         stories.append(
-            Story(
-                # 구획은 검색 키워드에서 나중에 채운다.
-                section="",
-                headline=clean_text(str(entry.get("headline", "")))
-                or articles[index].title,
-                summary=clean_text(str(entry.get("summary", ""))),
-                importance=importance if isinstance(importance, int) else 3,
-                representative=articles[index],
-                related=tuple(articles[value] for value in related_indexes),
+            prefer_original_outlet(
+                Story(
+                    # 구획은 검색 키워드에서 나중에 채운다.
+                    section="",
+                    headline=clean_text(str(entry.get("headline", "")))
+                    or articles[index].title,
+                    summary=clean_text(str(entry.get("summary", ""))),
+                    importance=importance if isinstance(importance, int) else 3,
+                    representative=articles[index],
+                    related=tuple(articles[value] for value in related_indexes),
+                )
             )
         )
 
     if not stories:
         raise RuntimeError("큐레이션 결과에서 유효한 기사를 찾지 못했습니다.")
-    stories.sort(key=lambda story: story.importance, reverse=True)
+    stories.sort(key=story_heat, reverse=True)
     return stories[:limit]
 
 
@@ -1040,6 +1075,30 @@ def curate_with_claude(
     return build_stories(payload, candidates, limit)
 
 
+HEAT_COVERAGE_CAP = 20
+HEAT_RELAY_PENALTY = 5
+
+
+def story_heat(story: Story) -> tuple[int, float]:
+    """지금 가장 이슈인 사건이 위로 오도록 순위 점수를 만든다.
+
+    중요도가 주된 기준이지만, 몇 개 매체가 달려들었는지도 화제성을 그대로
+    보여주는 신호다. 그래서 보도량이 많은 사건은 중요도가 한 단계 낮아도
+    앞설 수 있게 두고, 같으면 최신 기사를 먼저 놓는다.
+
+    원문 링크를 구할 수 없어 재배포본이 대표로 남은 사건은 조금 낮춘다.
+    단독 보도를 버리지는 않되, 같은 급이면 원문이 있는 사건에 자리를 준다.
+    """
+    coverage = min(len(story.articles), HEAT_COVERAGE_CAP)
+    score = story.importance * 10 + coverage
+    if is_aggregator(story.representative):
+        score -= HEAT_RELAY_PENALTY
+    published = story.representative.published or datetime.min.replace(
+        tzinfo=timezone.utc
+    )
+    return score, published.timestamp()
+
+
 def coverage_importance(outlets: int) -> int:
     """몇 개 언론사가 보도했는지로 중요도를 어림한다.
 
@@ -1059,25 +1118,19 @@ def curate_heuristically(articles: list[Article], limit: int) -> list[Story]:
         representative = max(cluster, key=representative_score)
         related = tuple(item for item in cluster if item is not representative)
         stories.append(
-            Story(
-                section="",
-                headline=representative.title,
-                summary=summarize(representative, max_length=200),
-                importance=coverage_importance(len(cluster)),
-                representative=representative,
-                related=related,
+            prefer_original_outlet(
+                Story(
+                    section="",
+                    headline=representative.title,
+                    summary=summarize(representative, max_length=200),
+                    importance=coverage_importance(len(cluster)),
+                    representative=representative,
+                    related=related,
+                )
             )
         )
 
-    # 보도량이 많은 사건을 먼저, 같으면 최신순으로 고른다.
-    stories.sort(
-        key=lambda story: (
-            story.importance,
-            story.representative.published
-            or datetime.min.replace(tzinfo=timezone.utc),
-        ),
-        reverse=True,
-    )
+    stories.sort(key=story_heat, reverse=True)
     return stories[:limit]
 
 
@@ -1139,21 +1192,26 @@ def story_section(story: Story, keywords: list[str]) -> str:
 def group_sections(
     stories: Iterable[Story], keywords: list[str]
 ) -> dict[str, list[Story]]:
-    """Story를 검색 키워드별 구획으로 묶는다. 구획 순서는 키워드 순서를 따른다.
+    """Story를 검색 키워드별 구획으로 묶고 화제성 순으로 정렬한다.
 
-    한 기사가 여러 키워드에 걸려도 구획 하나에만 넣으므로, 같은 사건이
-    여러 구획에 중복해서 나타나지 않는다.
+    구획 안에서도, 구획끼리도 지금 가장 이슈인 사건이 앞에 온다. 한 기사가
+    여러 키워드에 걸려도 구획 하나에만 넣으므로 같은 사건이 두 번 나오지 않는다.
     """
     grouped: dict[str, list[Story]] = {keyword: [] for keyword in keywords}
     for story in stories:
         section = story_section(story, keywords)
-        grouped.setdefault(section, []).append(
-            replace(story, section=section)
-        )
+        grouped.setdefault(section, []).append(replace(story, section=section))
     for entries in grouped.values():
-        entries.sort(key=lambda story: story.importance, reverse=True)
-    # 결과가 없는 키워드도 남겨 어떤 주제를 검색했는지 보이게 한다.
-    return grouped
+        entries.sort(key=story_heat, reverse=True)
+
+    # 가장 이슈인 사건을 품은 구획을 앞에 놓고, 결과가 없는 구획은 뒤로 보낸다.
+    # 빈 구획도 남겨 어떤 주제를 검색했는지 보이게 한다.
+    def section_heat(entries: list[Story]) -> tuple[int, float]:
+        return max((story_heat(story) for story in entries), default=(0, 0.0))
+
+    return dict(
+        sorted(grouped.items(), key=lambda item: section_heat(item[1]), reverse=True)
+    )
 
 
 def history_path() -> Path:

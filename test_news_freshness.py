@@ -419,18 +419,45 @@ class CurationTests(unittest.TestCase):
         self.assertEqual([], stories)
         self.assertEqual(app.HEURISTIC_CURATOR, curator)
 
-    def test_group_sections_uses_keyword_order_and_keeps_empty_keywords(self):
+    def test_group_sections_keeps_empty_keywords_at_the_end(self):
         stories = app.build_stories(self.payload(), self.candidates, limit=12)
 
         sections = app.group_sections(stories, ["개인정보보호법", "AI 보안", "개보위"])
 
-        # 구획 순서는 키워드를 준 순서를 그대로 따른다.
-        self.assertEqual(["개인정보보호법", "AI 보안", "개보위"], list(sections))
         self.assertEqual(1, len(sections["개인정보보호법"]))
         self.assertEqual(1, len(sections["AI 보안"]))
-        # 결과가 없는 키워드도 구획으로 남는다.
+        # 결과가 없는 키워드도 구획으로 남지만 뒤로 밀린다.
         self.assertEqual([], sections["개보위"])
+        self.assertEqual("개보위", list(sections)[-1])
         self.assertEqual("개인정보보호법", sections["개인정보보호법"][0].section)
+
+    def test_hotter_section_comes_first_regardless_of_keyword_order(self):
+        cool = article("작은 사건", "https://a.test/1", self.now, keywords=("앞 키워드",))
+        hot = article("큰 사건", "https://a.test/2", self.now, keywords=("뒤 키워드",))
+        payload = {
+            "stories": [
+                {
+                    "headline": "작은 사건",
+                    "summary": "",
+                    "importance": 2,
+                    "representative": 0,
+                    "related": [],
+                },
+                {
+                    "headline": "큰 사건",
+                    "summary": "",
+                    "importance": 5,
+                    "representative": 1,
+                    "related": [],
+                },
+            ]
+        }
+        stories = app.build_stories(payload, [cool, hot], limit=12)
+
+        sections = app.group_sections(stories, ["앞 키워드", "뒤 키워드"])
+
+        # 키워드 순서보다 화제성이 앞선다.
+        self.assertEqual(["뒤 키워드", "앞 키워드"], list(sections))
 
     def test_a_story_matching_two_keywords_lands_in_one_section_only(self):
         # 개인정보보호위원회와 개보위는 같은 기관이라 한 기사가 둘 다에 걸린다.
@@ -549,6 +576,124 @@ class OutputTests(unittest.TestCase):
         self.assertIn("1개 주제", text)
         self.assertIn("새 사건 1건", text)
         self.assertLessEqual(len(text), 200)
+
+
+class HeatOrderTests(unittest.TestCase):
+    def setUp(self):
+        self.now = datetime(2026, 9, 3, 1, 0, tzinfo=timezone.utc)
+
+    def story(self, importance: int, outlets: int, minutes_ago: int = 0) -> app.Story:
+        published = self.now - timedelta(minutes=minutes_ago)
+        articles = [
+            article(f"기사 {importance}-{index}", f"https://a.test/{importance}{index}", published)
+            for index in range(outlets)
+        ]
+        return app.Story(
+            section="",
+            headline=f"중요도{importance} 보도{outlets}",
+            summary="",
+            importance=importance,
+            representative=articles[0],
+            related=tuple(articles[1:]),
+        )
+
+    def test_importance_leads_the_ranking(self):
+        low = self.story(3, 4)
+        high = self.story(5, 4)
+
+        self.assertGreater(app.story_heat(high), app.story_heat(low))
+
+    def test_wide_coverage_can_outrank_one_importance_step(self):
+        widely_covered = self.story(4, 20)
+        lone_report = self.story(5, 1)
+
+        # 20개 매체가 다룬 사건이 단독 보도된 한 단계 위 사건보다 화제성이 높다.
+        self.assertGreater(app.story_heat(widely_covered), app.story_heat(lone_report))
+
+    def test_coverage_cannot_outrank_two_importance_steps(self):
+        widely_covered = self.story(3, 20)
+        important = self.story(5, 1)
+
+        self.assertGreater(app.story_heat(important), app.story_heat(widely_covered))
+
+    def test_relay_only_story_yields_to_an_equal_original(self):
+        original = self.story(4, 3)
+        relay = app.Story(
+            section="",
+            headline="재배포본만 있는 단독",
+            summary="",
+            importance=4,
+            representative=article(
+                "단독 기사", "https://news.nate.com/view/1", self.now, "네이트"
+            ),
+            related=tuple(
+                article(f"r{i}", f"https://news.nate.com/view/{i}", self.now, "네이트")
+                for i in range(1, 3)
+            ),
+        )
+
+        self.assertGreater(app.story_heat(original), app.story_heat(relay))
+        # 다만 한 단계 위 사건을 밀어낼 정도로 깎지는 않는다.
+        self.assertGreater(app.story_heat(relay), app.story_heat(self.story(3, 3)))
+
+    def test_newer_story_wins_a_tie(self):
+        older = self.story(4, 5, minutes_ago=120)
+        newer = self.story(4, 5, minutes_ago=5)
+
+        self.assertGreater(app.story_heat(newer), app.story_heat(older))
+
+
+class AggregatorTests(unittest.TestCase):
+    def setUp(self):
+        self.now = datetime(2026, 9, 3, 1, 0, tzinfo=timezone.utc)
+
+    def test_redistributors_are_detected_by_source_name(self):
+        # Google 피드는 링크가 재배포 매체인지 알려주지 않고 출처명만 준다.
+        by_name = article("기사", "https://news.google.com/rss/articles/X", self.now, "네이트")
+        by_host = article("기사", "https://v.daum.net/v/1", self.now, "어떤신문")
+        original = article("기사", "https://www.yna.co.kr/view/1", self.now, "연합뉴스")
+
+        self.assertTrue(app.is_aggregator(by_name))
+        self.assertTrue(app.is_aggregator(by_host))
+        self.assertFalse(app.is_aggregator(original))
+
+    def test_representative_swaps_to_the_original_outlet(self):
+        relay = article("기사", "https://news.google.com/rss/articles/X", self.now, "네이트")
+        original = article("기사", "https://www.yna.co.kr/view/1", self.now, "연합뉴스")
+        story = app.Story("", "제목", "", 4, relay, (original,))
+
+        fixed = app.prefer_original_outlet(story)
+
+        self.assertEqual("연합뉴스", fixed.representative.source)
+        self.assertEqual((relay,), fixed.related)
+        # 기사가 사라지거나 늘어나지 않는다.
+        self.assertEqual(set(story.articles), set(fixed.articles))
+
+    def test_representative_is_kept_when_only_redistributors_exist(self):
+        relay = article("기사", "https://www.msn.com/x", self.now, "이투데이 on MSN")
+        other = article("기사2", "https://news.nate.com/view/1", self.now, "네이트")
+        story = app.Story("", "제목", "", 4, relay, (other,))
+
+        self.assertEqual(story, app.prefer_original_outlet(story))
+
+    def test_curation_replaces_a_relayed_representative(self):
+        relay = article("기사", "https://news.nate.com/view/1", self.now, "네이트")
+        original = article("기사", "https://www.yna.co.kr/view/1", self.now, "연합뉴스")
+        payload = {
+            "stories": [
+                {
+                    "headline": "제목",
+                    "summary": "",
+                    "importance": 4,
+                    "representative": 0,
+                    "related": [1],
+                }
+            ]
+        }
+
+        stories = app.build_stories(payload, [relay, original], limit=12)
+
+        self.assertEqual("연합뉴스", stories[0].representative.source)
 
 
 class NoticeTests(unittest.TestCase):
