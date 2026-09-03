@@ -82,29 +82,33 @@ def build_page(
   <style>
     :root {{
       color-scheme: light dark;
-      --bg: #f4f7fb; --surface: #ffffff; --text: #172033; --muted: #64748b;
-      --line: #dce4ef; --accent: #2563eb; --accent-soft: #eaf1ff;
-      --shadow: 0 10px 28px rgba(30, 64, 175, .08);
+      /* 매일 읽는 문서라 색을 최대한 덜어냈다. 종이 같은 중성 배경에
+         강조색은 링크와 개수 표시에만 쓴다. */
+      --bg: #f7f6f3; --surface: #fffefc; --text: #23221f; --muted: #6f6d66;
+      --line: #e4e2dc; --accent: #1f6f5c; --accent-soft: #e9efec;
+      --head-bg: #2b2a27; --head-text: #f5f4f1; --head-muted: #b9b6ae;
+      --head-line: rgba(255,255,255,.22);
+      --shadow: 0 1px 2px rgba(0,0,0,.04), 0 6px 20px rgba(0,0,0,.04);
     }}
     * {{ box-sizing: border-box; }}
-    body {{ margin: 0; background: var(--bg); color: var(--text); font-family: Pretendard, "Noto Sans KR", system-ui, sans-serif; line-height: 1.65; }}
+    body {{ margin: 0; background: var(--bg); color: var(--text); font-family: Pretendard, "Noto Sans KR", system-ui, sans-serif; line-height: 1.7; }}
     .wrap {{ width: min(1120px, calc(100% - 32px)); margin: 0 auto; }}
-    header {{ padding: 64px 0 38px; background: linear-gradient(135deg, #172554, #1d4ed8 65%, #0ea5e9); color: white; }}
-    header h1 {{ margin: 0 0 12px; font-size: clamp(1.8rem, 5vw, 3rem); line-height: 1.2; letter-spacing: -.04em; }}
-    header p {{ margin: 0; color: #dbeafe; }}
-    .stats {{ display: flex; gap: 10px; flex-wrap: wrap; margin-top: 22px; }}
-    .notice {{ margin-top: 18px; padding-left: 12px; border-left: 2px solid rgba(255,255,255,.3); color: #dbeafe; font-size: .8rem; line-height: 1.6; text-wrap: pretty; }}
+    header {{ padding: 52px 0 34px; background: var(--head-bg); color: var(--head-text); }}
+    header h1 {{ margin: 0 0 10px; font-size: clamp(1.7rem, 4.4vw, 2.5rem); line-height: 1.25; letter-spacing: -.03em; font-weight: 750; }}
+    header p {{ margin: 0; color: var(--head-muted); }}
+    .stats {{ display: flex; gap: 8px; flex-wrap: wrap; margin-top: 20px; }}
+    .notice {{ margin-top: 18px; padding-left: 12px; border-left: 2px solid var(--head-line); color: var(--head-muted); font-size: .8rem; line-height: 1.65; text-wrap: pretty; }}
     .notice p {{ margin: 0 0 4px; }}
     .notice p:last-child {{ margin-bottom: 0; }}
-    .badge {{ padding: 7px 12px; border: 1px solid rgba(255,255,255,.25); border-radius: 999px; background: rgba(255,255,255,.12); font-size: .9rem; }}
-    main {{ padding: 28px 0 56px; }}
-    .topic {{ margin-bottom: 18px; overflow: hidden; border: 1px solid var(--line); border-radius: 18px; background: var(--surface); box-shadow: var(--shadow); }}
-    .topic > summary {{ display: flex; justify-content: space-between; align-items: center; gap: 16px; padding: 19px 22px; cursor: pointer; color: var(--accent); font-size: 1.18rem; font-weight: 800; list-style: none; }}
+    .badge {{ padding: 6px 12px; border: 1px solid var(--head-line); border-radius: 999px; font-size: .85rem; color: var(--head-text); }}
+    main {{ padding: 30px 0 56px; }}
+    .topic {{ margin-bottom: 16px; overflow: hidden; border: 1px solid var(--line); border-radius: 12px; background: var(--surface); box-shadow: var(--shadow); }}
+    .topic > summary {{ display: flex; justify-content: space-between; align-items: center; gap: 16px; padding: 18px 22px; cursor: pointer; color: var(--text); font-size: 1.1rem; font-weight: 700; list-style: none; }}
     .topic > summary::-webkit-details-marker {{ display: none; }}
     .topic > summary::before {{ content: "▸"; transition: transform .15s ease; }}
     .topic[open] > summary::before {{ transform: rotate(90deg); }}
     .topic > summary > span:first-of-type {{ margin-right: auto; }}
-    .count {{ padding: 3px 9px; border-radius: 999px; background: var(--accent-soft); font-size: .78rem; }}
+    .count {{ padding: 2px 9px; border-radius: 999px; background: var(--accent-soft); color: var(--accent); font-size: .76rem; font-weight: 600; }}
     .articles {{ display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); border-top: 1px solid var(--line); }}
     .article {{ min-width: 0; padding: 22px; border-bottom: 1px solid var(--line); }}
     .article:nth-child(odd) {{ border-right: 1px solid var(--line); }}
@@ -114,16 +118,21 @@ def build_page(
     .meta {{ margin: 0 0 10px; color: var(--muted); font-size: .82rem; }}
     .summary {{ margin: 0 0 13px; color: var(--text); font-size: .92rem; }}
     .related {{ margin: 0 0 13px; color: var(--muted); font-size: .8rem; }}
-    .article-link {{ color: var(--accent); font-size: .86rem; font-weight: 700; text-decoration: none; }}
+    .article-link {{ color: var(--accent); font-size: .85rem; font-weight: 600; text-decoration: none; }}
     .empty {{ padding: 24px; color: var(--muted); }}
     footer {{ padding: 24px 0 42px; color: var(--muted); text-align: center; font-size: .82rem; }}
     @media (max-width: 720px) {{
-      header {{ padding-top: 44px; }} .wrap {{ width: min(100% - 20px, 1120px); }}
+      header {{ padding-top: 40px; }} .wrap {{ width: min(100% - 20px, 1120px); }}
       .articles {{ grid-template-columns: 1fr; }} .article:nth-child(odd) {{ border-right: 0; }}
       .topic > summary, .article {{ padding: 17px; }}
     }}
     @media (prefers-color-scheme: dark) {{
-      :root {{ --bg: #0b1220; --surface: #111b2e; --text: #e5edf8; --muted: #94a3b8; --line: #24324a; --accent: #7db2ff; --accent-soft: #172b4d; --shadow: none; }}
+      :root {{
+        --bg: #171614; --surface: #201f1c; --text: #ecebe6; --muted: #9d9a93;
+        --line: #302e2a; --accent: #7cc0aa; --accent-soft: #1e2a26;
+        --head-bg: #100f0e; --head-text: #f0eee9; --head-muted: #a5a29b;
+        --head-line: rgba(255,255,255,.16); --shadow: none;
+      }}
     }}
   </style>
 </head>
