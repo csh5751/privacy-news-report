@@ -696,6 +696,94 @@ class AggregatorTests(unittest.TestCase):
         self.assertEqual("연합뉴스", stories[0].representative.source)
 
 
+class RevisitedTests(unittest.TestCase):
+    def setUp(self):
+        self.now = datetime(2026, 9, 3, 1, 0, tzinfo=timezone.utc)
+        self.new_story = app.Story(
+            section="개인정보 유출 사고",
+            headline="새 사건",
+            summary="처음 안내하는 사건.",
+            importance=5,
+            representative=article("새 사건", "https://a.test/new", self.now, "한국일보"),
+        )
+        self.old_story = app.Story(
+            section="",
+            headline="이미 안내한 사건",
+            summary="",
+            importance=4,
+            representative=article("이미 안내", "https://a.test/old", self.now, "연합뉴스"),
+            related=(article("이미 안내 2", "https://a.test/old2", self.now, "중앙일보"),),
+        )
+
+    def test_partition_keeps_the_already_reported_articles(self):
+        fresh = article("새 기사", "https://a.test/1", self.now)
+        seen = article("보낸 기사", "https://a.test/2", self.now)
+        excluded = app.article_keys(seen)
+
+        unsent, reported = app.partition_recent_articles(
+            [fresh, seen], excluded_keys=excluded, now=self.now
+        )
+
+        self.assertEqual([fresh], unsent)
+        self.assertEqual([seen], reported)
+
+    def test_partition_still_drops_articles_outside_the_window(self):
+        stale = article("오래된 기사", "https://a.test/1", self.now - timedelta(days=4))
+
+        unsent, reported = app.partition_recent_articles([stale], now=self.now)
+
+        self.assertEqual([], unsent)
+        self.assertEqual([], reported)
+
+    def test_revisited_block_lists_titles_after_the_new_stories(self):
+        stats = app.RunStats(
+            collected=300, already_sent=3, stories=1, curator=app.CURATION_MODEL
+        )
+
+        text = app.build_teams_message(
+            {"개인정보 유출 사고": [self.new_story]},
+            stats,
+            revisited=(self.old_story,),
+        )["text"]
+
+        self.assertIn("이미 안내한 사건 (1건)", text)
+        self.assertIn("보도 2건", text)
+        self.assertIn('href="https://a.test/old"', text)
+        # 새 사건이 먼저, 이미 안내한 목록이 뒤에 온다.
+        self.assertLess(text.index("새 사건"), text.index("이미 안내한 사건"))
+
+    def test_revisited_block_reports_hidden_events_not_articles(self):
+        stats = app.RunStats(
+            collected=300, already_sent=90, stories=1, curator=app.CURATION_MODEL
+        )
+
+        text = app.build_teams_message(
+            {"구획": [self.new_story]},
+            stats,
+            revisited=(self.old_story,),
+            revisited_hidden=12,
+        )["text"]
+
+        # 기사 수가 아니라 못 실은 사건 수를 알린다.
+        self.assertIn("사건 12건은 전체 보고서에서", text)
+        self.assertNotIn("90건은 전체 보고서에서", text)
+
+    def test_revisited_block_is_absent_when_nothing_was_hidden(self):
+        text = app.build_teams_message({"구획": [self.new_story]})["text"]
+
+        self.assertNotIn("이미 안내한 사건", text)
+
+    def test_revisited_block_shows_even_when_there_is_no_new_story(self):
+        stats = app.RunStats(
+            collected=300, already_sent=2, stories=0, curator=app.CURATION_MODEL
+        )
+
+        text = app.build_teams_message({}, stats, revisited=(self.old_story,))["text"]
+
+        self.assertIn("보고할 새 뉴스가 없습니다.", text)
+        self.assertIn("이미 안내한 사건 (1건)", text)
+
+
 class NoticeTests(unittest.TestCase):
     def stats(self, **overrides) -> app.RunStats:
         values = {

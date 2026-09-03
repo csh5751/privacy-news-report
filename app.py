@@ -149,6 +149,22 @@ class RunStats:
 
 
 @dataclass(frozen=True)
+class Report:
+    """한 번의 실행이 만들어낸 보고서 전체."""
+
+    sections: dict[str, list[Story]]
+    stats: RunStats
+    # 지난 브리핑에서 이미 안내해 본문에서는 뺀 사건들.
+    revisited: tuple[Story, ...] = ()
+    # 그 가운데 목록 길이 제한으로 싣지 못한 사건 수.
+    revisited_hidden: int = 0
+
+    @property
+    def total(self) -> int:
+        return sum(len(stories) for stories in self.sections.values())
+
+
+@dataclass(frozen=True)
 class KakaoConfig:
     rest_api_key: str
     client_secret: str
@@ -822,13 +838,17 @@ def cluster_stories(articles: Iterable[Article]) -> list[list[Article]]:
     return clusters
 
 
-def select_recent_articles(
+def partition_recent_articles(
     articles: Iterable[Article],
     window_hours: int = DEFAULT_WINDOW_HOURS,
     excluded_keys: set[str] | None = None,
     now: datetime | None = None,
-) -> list[Article]:
-    """시간 창 안에 있고 아직 보고하지 않은 기사를 최신순으로 모은다."""
+) -> tuple[list[Article], list[Article]]:
+    """시간 창 안의 기사를 (아직 안 보낸 기사, 이미 보낸 기사)로 나눈다.
+
+    이미 보낸 쪽도 버리지 않고 돌려준다. 브리핑 끝에 간단히 함께 보여주려면
+    개수만으로는 부족하고 기사 자체가 필요하다.
+    """
     current = now or datetime.now(timezone.utc)
     if current.tzinfo is None:
         current = current.replace(tzinfo=timezone.utc)
@@ -836,7 +856,8 @@ def select_recent_articles(
     start = current - timedelta(hours=window_hours)
     excluded = excluded_keys or set()
 
-    fresh: list[Article] = []
+    unsent: list[Article] = []
+    reported: list[Article] = []
     for article in articles:
         if article.published is None:
             continue
@@ -844,17 +865,33 @@ def select_recent_articles(
         # 발행 시각이 미래로 밀린 피드가 있어 약간의 여유를 둔다.
         if published < start or published > current + timedelta(minutes=10):
             continue
-        if article_keys(article) & excluded:
-            continue
-        fresh.append(article)
+        target = reported if article_keys(article) & excluded else unsent
+        target.append(article)
 
-    # 창 안에서만 합친다. 먼저 합치면 창 밖의 사본이 대표로 뽑혀 기사가 통째로 사라진다.
-    candidates = merge_duplicate_articles(fresh)
-    candidates.sort(
-        key=lambda item: item.published or datetime.min.replace(tzinfo=timezone.utc),
-        reverse=True,
+    def finalize(pool: list[Article]) -> list[Article]:
+        # 창 안에서만 합친다. 먼저 합치면 창 밖의 사본이 대표로 뽑혀 기사가 통째로 사라진다.
+        merged = merge_duplicate_articles(pool)
+        merged.sort(
+            key=lambda item: item.published
+            or datetime.min.replace(tzinfo=timezone.utc),
+            reverse=True,
+        )
+        return merged
+
+    return finalize(unsent), finalize(reported)
+
+
+def select_recent_articles(
+    articles: Iterable[Article],
+    window_hours: int = DEFAULT_WINDOW_HOURS,
+    excluded_keys: set[str] | None = None,
+    now: datetime | None = None,
+) -> list[Article]:
+    """시간 창 안에 있고 아직 보고하지 않은 기사를 최신순으로 모은다."""
+    unsent, _ = partition_recent_articles(
+        articles, window_hours=window_hours, excluded_keys=excluded_keys, now=now
     )
-    return candidates
+    return unsent
 
 
 CURATION_SCHEMA = {
@@ -1078,6 +1115,8 @@ def curate_with_claude(
 
 HEAT_COVERAGE_CAP = 20
 HEAT_RELAY_PENALTY = 5
+# 이미 안내한 사건은 목록만 짧게 붙인다. 길어지면 새 사건이 묻힌다.
+REVISITED_LIMIT = 8
 
 
 def story_heat(story: Story) -> tuple[int, float]:
@@ -1339,10 +1378,52 @@ def display_sections(sections: dict[str, list[Story]]) -> None:
                 print(f"   관련 보도 {len(story.related)}건: {names}")
 
 
+def revisited_teams_block(
+    revisited: tuple[Story, ...], hidden: int = 0
+) -> list[str]:
+    """이미 안내한 사건을 한 줄씩만 붙인다."""
+    if not revisited:
+        return []
+    lines = [
+        "<hr>",
+        f"<h3>이미 안내한 사건 ({len(revisited)}건)</h3>",
+        "<p><small>지난 브리핑에서 보낸 사건입니다. 보도가 이어지고 있어 제목만 함께 적었습니다."
+        "</small></p>",
+        "<ul>",
+    ]
+    for story in revisited:
+        article = story.representative
+        lines.append(
+            "<li>"
+            f'<a href="{html.escape(article.link, quote=True)}">'
+            f"{html.escape(story.headline)}</a> "
+            f"<small>{html.escape(article.source)} · 보도 {len(story.articles)}건</small>"
+            "</li>"
+        )
+    lines.append("</ul>")
+    if hidden > 0:
+        lines.append(
+            f"<p><small>이 밖에 사건 {hidden}건은 전체 보고서에서 확인하세요.</small></p>"
+        )
+    return lines
+
+
+def display_revisited(revisited: tuple[Story, ...]) -> None:
+    if not revisited:
+        return
+    print(f"\n{'=' * 72}\n이미 안내한 사건 ({len(revisited)}건)\n{'=' * 72}")
+    for number, story in enumerate(revisited, start=1):
+        article = story.representative
+        print(f"{number}. {story.headline}")
+        print(f"   {article.source} · 보도 {len(story.articles)}건 · {article.link}")
+
+
 def build_teams_message(
     sections: dict[str, list[Story]],
     stats: RunStats | None = None,
     report_url: str | None = None,
+    revisited: tuple[Story, ...] = (),
+    revisited_hidden: int = 0,
 ) -> dict[str, str]:
     """큐레이션한 구획 전체를 Teams 일반 메시지용 HTML 본문 하나로 만든다."""
     collected_at = datetime.now(KST).strftime("%Y-%m-%d %H:%M KST")
@@ -1362,6 +1443,7 @@ def build_teams_message(
         lines.append(f"<blockquote><small>{notice}</small></blockquote>")
     if not total:
         lines.append("<p>보고할 새 뉴스가 없습니다.</p>")
+        lines.extend(revisited_teams_block(revisited, revisited_hidden))
         return {"text": "".join(lines)}
 
     for title, stories in sections.items():
@@ -1397,19 +1479,26 @@ def build_teams_message(
             lines.append("".join(entry))
         lines.append("</ol>")
 
+    lines.extend(revisited_teams_block(revisited, revisited_hidden))
     return {"text": "".join(lines)}
 
 
 def send_to_teams(
     webhook_url: str,
-    sections: dict[str, list[Story]],
+    report: Report,
     timeout: float,
-    stats: RunStats | None = None,
     report_url: str | None = None,
 ) -> None:
     """큐레이션한 뉴스가 담긴 일반 메시지 하나를 Teams로 전송한다."""
     data = json.dumps(
-        build_teams_message(sections, stats, report_url), ensure_ascii=False
+        build_teams_message(
+            report.sections,
+            report.stats,
+            report_url,
+            report.revisited,
+            report.revisited_hidden,
+        ),
+        ensure_ascii=False,
     ).encode("utf-8")
     if len(data) > TEAMS_MAX_PAYLOAD_BYTES:
         raise RuntimeError(
@@ -1677,19 +1766,11 @@ def build_report(
     window_hours: int,
     api_key: str | None,
     excluded_keys: set[str] | None = None,
-) -> tuple[dict[str, list[Story]], RunStats]:
+) -> Report:
     """후보를 모아 큐레이션한 구획과 처리 내역을 만든다."""
     pool, failures = collect_candidates(keywords, timeout, window_hours)
-    excluded = excluded_keys or set()
-
-    # 이력으로 제외된 건수를 안내에 쓰려고 걸러내기 전후를 함께 센다.
-    fresh = select_recent_articles(pool, window_hours=window_hours)
-    candidates = (
-        select_recent_articles(
-            pool, window_hours=window_hours, excluded_keys=excluded
-        )
-        if excluded
-        else fresh
+    candidates, seen = partition_recent_articles(
+        pool, window_hours=window_hours, excluded_keys=excluded_keys or set()
     )
     print(
         f"[후보] 수집 {len(pool)}건 → 최근 {window_hours}시간 내 신규 {len(candidates)}건"
@@ -1700,10 +1781,17 @@ def build_report(
     sections = group_sections(stories, keywords)
     filled = sum(1 for entries in sections.values() if entries)
     reported = [story for entries in sections.values() for story in entries]
+
+    # 이미 보낸 기사는 모델을 다시 부르지 않는다. 한 번 안내한 사건이라
+    # 제목과 보도량만 있으면 되고, 묶는 데는 규칙만으로 충분하다.
+    # 몇 개 사건을 못 실었는지 알려면 자르기 전에 전체를 묶어야 한다.
+    clustered = curate_heuristically(seen, len(seen)) if seen else []
+    revisited = clustered[:REVISITED_LIMIT]
+
     stats = RunStats(
         collected=len(pool),
-        fresh=len(fresh),
-        already_sent=len(fresh) - len(candidates),
+        fresh=len(candidates) + len(seen),
+        already_sent=len(seen),
         irrelevant=len(candidates) - len(relevant),
         folded=sum(len(story.articles) for story in reported) - len(reported),
         stories=len(reported),
@@ -1711,7 +1799,17 @@ def build_report(
         failed_keywords=failures,
     )
     print(f"[정리] 구획 {filled}/{len(sections)}개 · 사건 {stats.stories}건")
-    return sections, stats
+    if clustered:
+        print(
+            f"[재확인] 이미 보낸 사건 {len(clustered)}건 가운데 "
+            f"{len(revisited)}건을 함께 적습니다."
+        )
+    return Report(
+        sections=sections,
+        stats=stats,
+        revisited=tuple(revisited),
+        revisited_hidden=len(clustered) - len(revisited),
+    )
 
 
 def run_news_cycle(
@@ -1726,24 +1824,25 @@ def run_news_cycle(
     """뉴스 수집·큐레이션과 콘솔 출력 및 Teams 전송을 한 차례 수행한다."""
     print(f"{', '.join(keywords)} 주제의 새 뉴스를 가져오는 중입니다...")
     history = load_sent_history()
-    sections, stats = build_report(
+    report = build_report(
         keywords, limit, timeout, window_hours, api_key, set(history)
     )
+    sections, stats = report.sections, report.stats
     failures = stats.failed_keywords
     display_sections(sections)
+    display_revisited(report.revisited)
     for line in notice_lines(stats):
         print(f"[안내] {line}")
 
+    # 본문에 실린 사건만 이력에 남긴다. 이미 안내한 목록은 다시 기록할 필요가 없다.
     reported_keys: set[str] = set()
-    total = 0
     for stories in sections.values():
         for story in stories:
-            total += 1
             for article in story.articles:
                 reported_keys.update(article_keys(article))
 
     # 사건이 하나도 없으면 "전부 0건" 알림을 보내지 않는다. HTML 보고서는 그래도 갱신된다.
-    if not total:
+    if not report.total:
         print("\n보고할 새 뉴스가 없어 전송을 생략합니다.")
         return 1 if keywords and failures == len(keywords) else 0
 
@@ -1752,10 +1851,10 @@ def run_news_cycle(
             retry_operation(
                 "Teams 전송",
                 lambda: send_to_teams(
-                    webhook_url, sections, timeout, stats, get_report_url()
+                    webhook_url, report, timeout, get_report_url()
                 ),
             )
-            print(f"[Teams] 사건 {total}건을 본문 하나로 전송 완료")
+            print(f"[Teams] 사건 {report.total}건을 본문 하나로 전송 완료")
         except RuntimeError as exc:
             print(f"\n[Teams] 전송 실패: {exc}", file=sys.stderr)
             return 1

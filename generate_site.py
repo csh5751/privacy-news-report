@@ -189,9 +189,10 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     # 보고서는 전체 현황을 보여주는 페이지라 전송 이력으로 걸러내지 않는다.
-    sections, stats = app.build_report(
+    report = app.build_report(
         keywords, args.limit, args.timeout, args.window_hours, api_key
     )
+    sections, stats = report.sections, report.stats
     for line in app.notice_lines(stats):
         print(f"[안내] {line}")
 
