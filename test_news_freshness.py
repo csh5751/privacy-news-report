@@ -769,6 +769,41 @@ class NoticeTests(unittest.TestCase):
         self.assertNotIn("Claude", text)
 
 
+class ReportLinkTests(unittest.TestCase):
+    def test_teams_message_links_the_html_report_near_the_top(self):
+        now = datetime(2026, 9, 3, 1, 0, tzinfo=timezone.utc)
+        story = app.Story(
+            section="개인정보 유출 사고",
+            headline="티빙, 개인정보 유출 공식 사과",
+            summary="사과했다.",
+            importance=5,
+            representative=article("티빙 사과", "https://a.test/1", now, "한국일보"),
+        )
+        url = "https://example.github.io/report/"
+
+        text = app.build_teams_message(
+            {"개인정보 유출 사고": [story]}, report_url=url
+        )["text"]
+
+        self.assertIn(f'href="{url}"', text)
+        self.assertLess(text.index(url), text.index("<h3>"))
+
+    def test_teams_message_omits_the_link_when_no_url_is_given(self):
+        self.assertNotIn("전체 HTML 보고서", app.build_teams_message({})["text"])
+
+    def test_report_url_falls_back_to_the_published_page(self):
+        self.assertEqual(app.DEFAULT_REPORT_URL, app.get_report_url())
+        self.assertTrue(app.get_report_url().startswith("https://"))
+
+    def test_report_url_is_escaped_in_the_link(self):
+        text = app.build_teams_message(
+            {}, report_url='https://a.test/?q="x"&y=1'
+        )["text"]
+
+        self.assertNotIn('?q="x"', text)
+        self.assertIn("&amp;y=1", text)
+
+
 class RetryTests(unittest.TestCase):
     def test_retry_succeeds_on_third_attempt(self):
         calls = 0

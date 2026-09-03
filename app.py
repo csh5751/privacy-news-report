@@ -42,6 +42,7 @@ TAG_RE = re.compile(r"<[^>]+>")
 SPACE_RE = re.compile(r"\s+")
 SENTENCE_RE = re.compile(r"(?<=[.!?。]|[다요죠])\s+")
 TEAMS_MAX_PAYLOAD_BYTES = 25_000
+DEFAULT_REPORT_URL = "https://csh5751.github.io/privacy-news-report/"
 KST = timezone(timedelta(hours=9))
 HISTORY_RETENTION_DAYS = 30
 LOG_RETENTION_DAYS = 30
@@ -1339,7 +1340,9 @@ def display_sections(sections: dict[str, list[Story]]) -> None:
 
 
 def build_teams_message(
-    sections: dict[str, list[Story]], stats: RunStats | None = None
+    sections: dict[str, list[Story]],
+    stats: RunStats | None = None,
+    report_url: str | None = None,
 ) -> dict[str, str]:
     """큐레이션한 구획 전체를 Teams 일반 메시지용 HTML 본문 하나로 만든다."""
     collected_at = datetime.now(KST).strftime("%Y-%m-%d %H:%M KST")
@@ -1348,6 +1351,12 @@ def build_teams_message(
         "<h2>📰 개인정보 보호 · AI 보안 뉴스 브리핑</h2>",
         f"<p><em>수집 시각: {html.escape(collected_at)} · 새 사건 {total}건</em></p>",
     ]
+    if report_url:
+        link = html.escape(report_url, quote=True)
+        lines.append(
+            f'<p>📄 <a href="{link}"><strong>전체 HTML 보고서 보기</strong></a>'
+            "<br><small>보고서 페이지는 이미 보낸 기사까지 포함한 전체 목록입니다.</small></p>"
+        )
     if stats is not None:
         notice = "<br>".join(html.escape(line) for line in notice_lines(stats))
         lines.append(f"<blockquote><small>{notice}</small></blockquote>")
@@ -1396,10 +1405,11 @@ def send_to_teams(
     sections: dict[str, list[Story]],
     timeout: float,
     stats: RunStats | None = None,
+    report_url: str | None = None,
 ) -> None:
     """큐레이션한 뉴스가 담긴 일반 메시지 하나를 Teams로 전송한다."""
     data = json.dumps(
-        build_teams_message(sections, stats), ensure_ascii=False
+        build_teams_message(sections, stats, report_url), ensure_ascii=False
     ).encode("utf-8")
     if len(data) > TEAMS_MAX_PAYLOAD_BYTES:
         raise RuntimeError(
@@ -1487,6 +1497,11 @@ def get_anthropic_api_key() -> str | None:
     return get_user_setting("ANTHROPIC_API_KEY")
 
 
+def get_report_url() -> str:
+    """HTML 보고서가 올라가는 주소를 반환한다."""
+    return get_user_setting("REPORT_URL") or DEFAULT_REPORT_URL
+
+
 def get_anthropic_workspace_id() -> str | None:
     """조직 계정의 identity-linked 키는 워크스페이스 ID를 함께 보내야 한다."""
     return get_user_setting("ANTHROPIC_WORKSPACE_ID")
@@ -1509,8 +1524,7 @@ def get_kakao_config() -> KakaoConfig | None:
         rest_api_key=values["rest_api_key"] or "",
         client_secret=values["client_secret"] or "",
         refresh_token=values["refresh_token"] or "",
-        link_url=get_user_setting("KAKAO_LINK_URL")
-        or "https://csh5751.github.io/privacy-news-report/",
+        link_url=get_user_setting("KAKAO_LINK_URL") or get_report_url(),
     )
 
 
@@ -1737,7 +1751,9 @@ def run_news_cycle(
         try:
             retry_operation(
                 "Teams 전송",
-                lambda: send_to_teams(webhook_url, sections, timeout, stats),
+                lambda: send_to_teams(
+                    webhook_url, sections, timeout, stats, get_report_url()
+                ),
             )
             print(f"[Teams] 사건 {total}건을 본문 하나로 전송 완료")
         except RuntimeError as exc:
