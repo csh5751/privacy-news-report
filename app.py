@@ -12,7 +12,7 @@ import subprocess
 import sys
 import time
 import traceback
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from difflib import SequenceMatcher
 from email.utils import parsedate_to_datetime
@@ -82,6 +82,8 @@ class Article:
     source: str
     published: datetime | None
     description: str
+    # 이 기사를 찾아낸 검색 키워드. 한 기사가 여러 키워드에 걸릴 수 있다.
+    keywords: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -519,7 +521,8 @@ def fetch_news(
             print(f"[소스 실패] {keyword} / {name}: {exc}", file=sys.stderr)
             continue
         print(f"[소스] {keyword} / {name}: {len(found)}건")
-        collected.extend(found)
+        # 어떤 키워드가 찾아낸 기사인지 남겨 보고서 구획을 나누는 데 쓴다.
+        collected.extend(replace(article, keywords=(keyword,)) for article in found)
 
     if failures and not collected:
         raise RuntimeError(f"모든 뉴스 소스가 실패했습니다 ({'; '.join(failures)})")
@@ -568,16 +571,24 @@ def merge_duplicate_articles(articles: Iterable[Article]) -> list[Article]:
         for key in keys:
             index.setdefault(key, target)
 
-    return [
-        max(
+    merged: list[Article] = []
+    for group in groups:
+        best = max(
             group,
             key=lambda item: (
                 len(clean_text(item.description)),
                 representative_score(item),
             ),
         )
-        for group in groups
-    ]
+        # 여러 키워드에 걸린 기사는 그 사실을 모두 남긴다. 대표 사본의 키워드만
+        # 남기면 어느 구획에 넣을지 결정할 근거를 잃는다.
+        keywords = tuple(
+            dict.fromkeys(
+                keyword for item in group for keyword in item.keywords
+            )
+        )
+        merged.append(replace(best, keywords=keywords))
+    return merged
 
 
 def article_keys(article: Article) -> set[str]:
@@ -712,61 +723,47 @@ def select_recent_articles(
 CURATION_SCHEMA = {
     "type": "object",
     "properties": {
-        "sections": {
+        "stories": {
             "type": "array",
-            "description": "내용에 맞게 직접 정한 주제 구획. 중요한 구획을 먼저 놓는다.",
+            "description": "보고할 사건 목록. 중요한 사건을 먼저 놓는다.",
             "items": {
                 "type": "object",
                 "properties": {
-                    "title": {
+                    "headline": {
                         "type": "string",
-                        "description": "짧은 한국어 명사구 제목. 예: 제재·과징금",
+                        "description": "사건을 한 줄로 설명하는 한국어 제목",
                     },
-                    "stories": {
+                    "summary": {
+                        "type": "string",
+                        "description": "기사에 실제로 담긴 사실만 담은 두 문장 이내 한국어 요약",
+                    },
+                    "importance": {
+                        "type": "integer",
+                        "description": "실무 중요도. 5가 가장 높다.",
+                        "enum": [1, 2, 3, 4, 5],
+                    },
+                    "representative": {
+                        "type": "integer",
+                        "description": "대표로 삼을 후보 기사 번호",
+                    },
+                    "related": {
                         "type": "array",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "headline": {
-                                    "type": "string",
-                                    "description": "사건을 한 줄로 설명하는 한국어 제목",
-                                },
-                                "summary": {
-                                    "type": "string",
-                                    "description": "기사에 실제로 담긴 사실만 담은 두 문장 이내 한국어 요약",
-                                },
-                                "importance": {
-                                    "type": "integer",
-                                    "description": "실무 중요도. 5가 가장 높다.",
-                                    "enum": [1, 2, 3, 4, 5],
-                                },
-                                "representative": {
-                                    "type": "integer",
-                                    "description": "대표로 삼을 후보 기사 번호",
-                                },
-                                "related": {
-                                    "type": "array",
-                                    "description": "같은 사건을 다룬 다른 후보 기사 번호",
-                                    "items": {"type": "integer"},
-                                },
-                            },
-                            "required": [
-                                "headline",
-                                "summary",
-                                "importance",
-                                "representative",
-                                "related",
-                            ],
-                            "additionalProperties": False,
-                        },
+                        "description": "같은 사건을 다룬 다른 후보 기사 번호",
+                        "items": {"type": "integer"},
                     },
                 },
-                "required": ["title", "stories"],
+                "required": [
+                    "headline",
+                    "summary",
+                    "importance",
+                    "representative",
+                    "related",
+                ],
                 "additionalProperties": False,
             },
         }
     },
-    "required": ["sections"],
+    "required": ["stories"],
     "additionalProperties": False,
 }
 
@@ -790,10 +787,6 @@ CURATION_SYSTEM_PROMPT = """\
 - 5: 대규모 유출 사고, 과징금·제재 처분, 법령·고시 개정 확정
 - 3~4: 조사 착수, 제도 예고, 주요 기관의 정책 발표, 중대한 취약점 공개
 - 1~2: 행사·공모전, 협약, 일반 동향 소개
-
-구획:
-- 후보 내용에 맞게 3~6개의 구획을 직접 정합니다. 검색 키워드를 그대로 쓰지 마세요.
-- 구획 제목은 짧은 한국어 명사구로 씁니다.
 
 요약:
 - 후보 목록에 실제로 나온 사실만 씁니다. 추측하거나 없는 수치를 만들지 마세요.
@@ -822,50 +815,44 @@ def format_candidates(articles: list[Article]) -> str:
 def build_stories(
     payload: dict[str, object], articles: list[Article], limit: int
 ) -> list[Story]:
-    """모델이 돌려준 구획 정보를 검증해 Story 목록으로 바꾼다."""
-    sections = payload.get("sections")
-    if not isinstance(sections, list):
-        raise RuntimeError("큐레이션 응답에 sections가 없습니다.")
+    """모델이 돌려준 사건 목록을 검증해 Story로 바꾼다."""
+    entries = payload.get("stories")
+    if not isinstance(entries, list):
+        raise RuntimeError("큐레이션 응답에 stories가 없습니다.")
 
     stories: list[Story] = []
     used: set[int] = set()
-    for section in sections:
-        if not isinstance(section, dict):
+    for entry in entries:
+        if not isinstance(entry, dict):
             continue
-        title = clean_text(str(section.get("title", ""))) or "기타"
-        entries = section.get("stories")
-        if not isinstance(entries, list):
+        index = entry.get("representative")
+        if not isinstance(index, int) or not 0 <= index < len(articles):
             continue
-        for entry in entries:
-            if not isinstance(entry, dict):
-                continue
-            index = entry.get("representative")
-            if not isinstance(index, int) or not 0 <= index < len(articles):
-                continue
-            if index in used:
-                continue
-            related_indexes = [
-                value
-                for value in entry.get("related", [])
-                if isinstance(value, int)
-                and 0 <= value < len(articles)
-                and value != index
-                and value not in used
-            ]
-            used.add(index)
-            used.update(related_indexes)
-            importance = entry.get("importance")
-            stories.append(
-                Story(
-                    section=title,
-                    headline=clean_text(str(entry.get("headline", "")))
-                    or articles[index].title,
-                    summary=clean_text(str(entry.get("summary", ""))),
-                    importance=importance if isinstance(importance, int) else 3,
-                    representative=articles[index],
-                    related=tuple(articles[value] for value in related_indexes),
-                )
+        if index in used:
+            continue
+        related_indexes = [
+            value
+            for value in entry.get("related", [])
+            if isinstance(value, int)
+            and 0 <= value < len(articles)
+            and value != index
+            and value not in used
+        ]
+        used.add(index)
+        used.update(related_indexes)
+        importance = entry.get("importance")
+        stories.append(
+            Story(
+                # 구획은 검색 키워드에서 나중에 채운다.
+                section="",
+                headline=clean_text(str(entry.get("headline", "")))
+                or articles[index].title,
+                summary=clean_text(str(entry.get("summary", ""))),
+                importance=importance if isinstance(importance, int) else 3,
+                representative=articles[index],
+                related=tuple(articles[value] for value in related_indexes),
             )
+        )
 
     if not stories:
         raise RuntimeError("큐레이션 결과에서 유효한 기사를 찾지 못했습니다.")
@@ -959,7 +946,7 @@ def curate_heuristically(articles: list[Article], limit: int) -> list[Story]:
         related = tuple(item for item in cluster if item is not representative)
         stories.append(
             Story(
-                section="수집 기사",
+                section="",
                 headline=representative.title,
                 summary=summarize(representative, max_length=200),
                 importance=3,
@@ -1001,20 +988,35 @@ def curate(
         return curate_heuristically(articles, limit)
 
 
-def group_sections(stories: Iterable[Story]) -> dict[str, list[Story]]:
-    """Story를 구획별로 묶는다. 구획 순서는 최고 중요도 순이다."""
-    grouped: dict[str, list[Story]] = {}
+OTHER_SECTION = "기타"
+
+
+def story_section(story: Story, keywords: list[str]) -> str:
+    """사건이 속할 구획을 정한다. 여러 키워드에 걸리면 앞선 키워드를 쓴다."""
+    found = {
+        keyword for article in story.articles for keyword in article.keywords
+    }
+    return next((keyword for keyword in keywords if keyword in found), OTHER_SECTION)
+
+
+def group_sections(
+    stories: Iterable[Story], keywords: list[str]
+) -> dict[str, list[Story]]:
+    """Story를 검색 키워드별 구획으로 묶는다. 구획 순서는 키워드 순서를 따른다.
+
+    한 기사가 여러 키워드에 걸려도 구획 하나에만 넣으므로, 같은 사건이
+    여러 구획에 중복해서 나타나지 않는다.
+    """
+    grouped: dict[str, list[Story]] = {keyword: [] for keyword in keywords}
     for story in stories:
-        grouped.setdefault(story.section, []).append(story)
+        section = story_section(story, keywords)
+        grouped.setdefault(section, []).append(
+            replace(story, section=section)
+        )
     for entries in grouped.values():
         entries.sort(key=lambda story: story.importance, reverse=True)
-    return dict(
-        sorted(
-            grouped.items(),
-            key=lambda item: max(story.importance for story in item[1]),
-            reverse=True,
-        )
-    )
+    # 결과가 없는 키워드도 남겨 어떤 주제를 검색했는지 보이게 한다.
+    return grouped
 
 
 def history_path() -> Path:
@@ -1083,12 +1085,11 @@ def story_summary(story: Story, max_length: int = 200) -> str:
 
 
 def display_sections(sections: dict[str, list[Story]]) -> None:
-    if not sections:
-        print("\n보고할 새 뉴스가 없습니다.")
-        return
-
     for title, stories in sections.items():
         print(f"\n{'=' * 72}\n{title} ({len(stories)}건)\n{'=' * 72}")
+        if not stories:
+            print("검색된 뉴스가 없습니다.")
+            continue
         for number, story in enumerate(stories, start=1):
             article = story.representative
             print(f"\n{number}. [중요도 {story.importance}] {story.headline}")
@@ -1108,7 +1109,7 @@ def build_teams_message(sections: dict[str, list[Story]]) -> dict[str, str]:
         "<h2>📰 개인정보 보호 · AI 보안 뉴스 브리핑</h2>",
         f"<p><em>수집 시각: {html.escape(collected_at)} · 새 사건 {total}건</em></p>",
     ]
-    if not sections:
+    if not total:
         lines.append("<p>보고할 새 뉴스가 없습니다.</p>")
         return {"text": "".join(lines)}
 
@@ -1117,9 +1118,12 @@ def build_teams_message(sections: dict[str, list[Story]]) -> dict[str, str]:
             [
                 "<hr>",
                 f"<h3>{html.escape(title)} ({len(stories)}건)</h3>",
-                "<ol>",
             ]
         )
+        if not stories:
+            lines.append("<p>검색된 뉴스가 없습니다.</p>")
+            continue
+        lines.append("<ol>")
         for story in stories:
             article = story.representative
             headline = html.escape(story.headline)
@@ -1291,9 +1295,10 @@ def build_kakao_text(sections: dict[str, list[Story]]) -> str:
     """HTML 뉴스 보고서를 안내하는 카카오 메시지를 만든다."""
     collected_at = datetime.now(KST).strftime("%Y-%m-%d %H:%M KST")
     story_count = sum(len(stories) for stories in sections.values())
+    filled = sum(1 for stories in sections.values() if stories)
     return (
         "개인정보 보호 · AI 보안 뉴스 브리핑\n"
-        f"{len(sections)}개 주제에서 새 사건 {story_count}건을 정리했습니다.\n"
+        f"{filled}개 주제에서 새 사건 {story_count}건을 정리했습니다.\n"
         f"업데이트: {collected_at}\n"
         "아래 버튼을 눌러 전체 HTML 보고서를 확인하세요."
     )[:200]
@@ -1429,8 +1434,9 @@ def build_report(
         keywords, timeout, window_hours, excluded_keys or set()
     )
     stories = curate(candidates, limit, api_key)
-    sections = group_sections(stories)
-    print(f"[정리] 구획 {len(sections)}개 · 사건 {len(stories)}건")
+    sections = group_sections(stories, keywords)
+    filled = sum(1 for entries in sections.values() if entries)
+    print(f"[정리] 구획 {filled}/{len(sections)}개 · 사건 {len(stories)}건")
     return sections, failures
 
 
@@ -1452,23 +1458,30 @@ def run_news_cycle(
     display_sections(sections)
 
     reported_keys: set[str] = set()
+    total = 0
     for stories in sections.values():
         for story in stories:
+            total += 1
             for article in story.articles:
                 reported_keys.update(article_keys(article))
 
-    if webhook_url and sections:
+    # 사건이 하나도 없으면 "전부 0건" 알림을 보내지 않는다. HTML 보고서는 그래도 갱신된다.
+    if not total:
+        print("\n보고할 새 뉴스가 없어 전송을 생략합니다.")
+        return 1 if keywords and failures == len(keywords) else 0
+
+    if webhook_url:
         try:
             retry_operation(
                 "Teams 전송",
                 lambda: send_to_teams(webhook_url, sections, timeout),
             )
-            print(f"[Teams] {len(sections)}개 구획을 본문 하나로 전송 완료")
+            print(f"[Teams] 사건 {total}건을 본문 하나로 전송 완료")
         except RuntimeError as exc:
             print(f"\n[Teams] 전송 실패: {exc}", file=sys.stderr)
             return 1
 
-    if kakao_config and sections:
+    if kakao_config:
         try:
             retry_operation(
                 "카카오톡 전송",

@@ -31,8 +31,9 @@ def article(
     published: datetime,
     source: str = "테스트",
     description: str = "",
+    keywords: tuple[str, ...] = (),
 ) -> app.Article:
-    return app.Article(title, link, source, published, description)
+    return app.Article(title, link, source, published, description, keywords)
 
 
 class FeedParsingTests(unittest.TestCase):
@@ -67,9 +68,14 @@ class FeedParsingTests(unittest.TestCase):
         )
         app.fetch_bing_news = lambda *a, **k: good
         try:
-            self.assertEqual(good, app.fetch_news("개인정보", timeout=1))
+            collected = app.fetch_news("개인정보", timeout=1)
         finally:
             app.fetch_google_news, app.fetch_bing_news = original_google, original_bing
+
+        self.assertEqual(1, len(collected))
+        self.assertEqual("살아남은 기사", collected[0].title)
+        # 어느 키워드가 찾아낸 기사인지 기록해 구획을 나누는 근거로 쓴다.
+        self.assertEqual(("개인정보",), collected[0].keywords)
 
     def test_fetch_news_raises_only_when_every_source_fails(self):
         def boom(*args, **kwargs):
@@ -168,38 +174,47 @@ class CandidateSelectionTests(unittest.TestCase):
 class CurationTests(unittest.TestCase):
     def setUp(self):
         self.now = datetime(2026, 9, 2, 1, 0, tzinfo=timezone.utc)
+        self.keywords = ["개인정보보호법", "AI 보안"]
         self.candidates = [
-            article("A사 과징금 12억", "https://a.test/1", self.now, "연합뉴스"),
-            article("A사에 과징금 부과", "https://a.test/2", self.now, "이투데이"),
-            article("공모전 개최", "https://a.test/3", self.now, "전자신문"),
+            article(
+                "A사 과징금 12억",
+                "https://a.test/1",
+                self.now,
+                "연합뉴스",
+                keywords=("개인정보보호법",),
+            ),
+            article(
+                "A사에 과징금 부과",
+                "https://a.test/2",
+                self.now,
+                "이투데이",
+                keywords=("개인정보보호법",),
+            ),
+            article(
+                "공모전 개최",
+                "https://a.test/3",
+                self.now,
+                "전자신문",
+                keywords=("AI 보안",),
+            ),
         ]
 
     def payload(self):
         return {
-            "sections": [
+            "stories": [
                 {
-                    "title": "제재·과징금",
-                    "stories": [
-                        {
-                            "headline": "개인정보위, A사에 과징금 12억원 부과",
-                            "summary": "개인정보위가 A사에 과징금을 부과했다.",
-                            "importance": 5,
-                            "representative": 0,
-                            "related": [1],
-                        }
-                    ],
+                    "headline": "개인정보위, A사에 과징금 12억원 부과",
+                    "summary": "개인정보위가 A사에 과징금을 부과했다.",
+                    "importance": 5,
+                    "representative": 0,
+                    "related": [1],
                 },
                 {
-                    "title": "행사",
-                    "stories": [
-                        {
-                            "headline": "공모전 개최",
-                            "summary": "공모전이 열린다.",
-                            "importance": 1,
-                            "representative": 2,
-                            "related": [],
-                        }
-                    ],
+                    "headline": "공모전 개최",
+                    "summary": "공모전이 열린다.",
+                    "importance": 1,
+                    "representative": 2,
+                    "related": [],
                 },
             ]
         }
@@ -208,7 +223,6 @@ class CurationTests(unittest.TestCase):
         stories = app.build_stories(self.payload(), self.candidates, limit=12)
 
         self.assertEqual(2, len(stories))
-        self.assertEqual("제재·과징금", stories[0].section)
         self.assertEqual(5, stories[0].importance)
         self.assertEqual(self.candidates[0], stories[0].representative)
         self.assertEqual((self.candidates[1],), stories[0].related)
@@ -217,33 +231,28 @@ class CurationTests(unittest.TestCase):
 
     def test_build_stories_drops_out_of_range_and_reused_indexes(self):
         payload = {
-            "sections": [
+            "stories": [
                 {
-                    "title": "구획",
-                    "stories": [
-                        {
-                            "headline": "첫 사건",
-                            "summary": "",
-                            "importance": 4,
-                            "representative": 0,
-                            "related": [99, 1],
-                        },
-                        {
-                            "headline": "같은 기사를 재사용",
-                            "summary": "",
-                            "importance": 4,
-                            "representative": 1,
-                            "related": [],
-                        },
-                        {
-                            "headline": "없는 기사",
-                            "summary": "",
-                            "importance": 4,
-                            "representative": 42,
-                            "related": [],
-                        },
-                    ],
-                }
+                    "headline": "첫 사건",
+                    "summary": "",
+                    "importance": 4,
+                    "representative": 0,
+                    "related": [99, 1],
+                },
+                {
+                    "headline": "같은 기사를 재사용",
+                    "summary": "",
+                    "importance": 4,
+                    "representative": 1,
+                    "related": [],
+                },
+                {
+                    "headline": "없는 기사",
+                    "summary": "",
+                    "importance": 4,
+                    "representative": 42,
+                    "related": [],
+                },
             ]
         }
 
@@ -259,10 +268,12 @@ class CurationTests(unittest.TestCase):
         self.assertEqual(5, stories[0].importance)
 
     def test_build_stories_rejects_payload_without_usable_articles(self):
-        payload = {"sections": [{"title": "구획", "stories": []}]}
-
         with self.assertRaises(RuntimeError):
-            app.build_stories(payload, self.candidates, limit=12)
+            app.build_stories({"stories": []}, self.candidates, limit=12)
+
+    def test_build_stories_rejects_payload_missing_stories(self):
+        with self.assertRaisesRegex(RuntimeError, "stories"):
+            app.build_stories({"sections": []}, self.candidates, limit=12)
 
     def test_curate_falls_back_to_heuristics_when_claude_fails(self):
         original = app.curate_with_claude
@@ -277,7 +288,6 @@ class CurationTests(unittest.TestCase):
             app.curate_with_claude = original
 
         self.assertTrue(stories)
-        self.assertTrue(all(story.section == "수집 기사" for story in stories))
 
     def test_curate_uses_heuristics_without_an_api_key(self):
         stories = app.curate(self.candidates, limit=12, api_key=None)
@@ -290,12 +300,85 @@ class CurationTests(unittest.TestCase):
     def test_curate_returns_nothing_for_an_empty_pool(self):
         self.assertEqual([], app.curate([], limit=12, api_key="test-key"))
 
-    def test_group_sections_orders_by_highest_importance(self):
+    def test_group_sections_uses_keyword_order_and_keeps_empty_keywords(self):
         stories = app.build_stories(self.payload(), self.candidates, limit=12)
 
-        sections = app.group_sections(stories)
+        sections = app.group_sections(stories, ["개인정보보호법", "AI 보안", "개보위"])
 
-        self.assertEqual(["제재·과징금", "행사"], list(sections))
+        # 구획 순서는 키워드를 준 순서를 그대로 따른다.
+        self.assertEqual(["개인정보보호법", "AI 보안", "개보위"], list(sections))
+        self.assertEqual(1, len(sections["개인정보보호법"]))
+        self.assertEqual(1, len(sections["AI 보안"]))
+        # 결과가 없는 키워드도 구획으로 남는다.
+        self.assertEqual([], sections["개보위"])
+        self.assertEqual("개인정보보호법", sections["개인정보보호법"][0].section)
+
+    def test_a_story_matching_two_keywords_lands_in_one_section_only(self):
+        # 개인정보보호위원회와 개보위는 같은 기관이라 한 기사가 둘 다에 걸린다.
+        overlapping = article(
+            "개인정보위 전체회의 의결",
+            "https://a.test/9",
+            self.now,
+            "연합뉴스",
+            keywords=("개보위", "개인정보보호위원회"),
+        )
+        payload = {
+            "stories": [
+                {
+                    "headline": "개인정보위 전체회의 의결",
+                    "summary": "의결했다.",
+                    "importance": 4,
+                    "representative": 0,
+                    "related": [],
+                }
+            ]
+        }
+        stories = app.build_stories(payload, [overlapping], limit=12)
+
+        sections = app.group_sections(stories, ["개인정보보호위원회", "개보위"])
+
+        # 앞선 키워드의 구획에만 들어가고 중복 노출되지 않는다.
+        self.assertEqual(1, len(sections["개인정보보호위원회"]))
+        self.assertEqual([], sections["개보위"])
+
+    def test_stories_without_a_known_keyword_go_to_the_other_section(self):
+        orphan = article("출처 불명 사건", "https://a.test/8", self.now)
+        payload = {
+            "stories": [
+                {
+                    "headline": "출처 불명 사건",
+                    "summary": "",
+                    "importance": 3,
+                    "representative": 0,
+                    "related": [],
+                }
+            ]
+        }
+        stories = app.build_stories(payload, [orphan], limit=12)
+
+        sections = app.group_sections(stories, ["개인정보보호법"])
+
+        self.assertEqual([], sections["개인정보보호법"])
+        self.assertEqual(1, len(sections[app.OTHER_SECTION]))
+
+    def test_merge_keeps_every_keyword_that_found_the_article(self):
+        first = article(
+            "같은 제목", "https://a.test/1", self.now, keywords=("개보위",)
+        )
+        second = article(
+            "같은 제목",
+            "https://b.test/1",
+            self.now,
+            "연합뉴스",
+            "설명이 있는 사본",
+            keywords=("개인정보보호법",),
+        )
+
+        merged = app.merge_duplicate_articles([first, second])
+
+        self.assertEqual(1, len(merged))
+        self.assertEqual("설명이 있는 사본", merged[0].description)
+        self.assertEqual({"개보위", "개인정보보호법"}, set(merged[0].keywords))
 
 
 class OutputTests(unittest.TestCase):

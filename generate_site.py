@@ -36,7 +36,10 @@ def story_html(story: app.Story) -> str:
 
 def section_html(title: str, stories: list[app.Story]) -> str:
     title_text = html.escape(title)
-    contents = "".join(story_html(story) for story in stories)
+    if stories:
+        contents = "".join(story_html(story) for story in stories)
+    else:
+        contents = '<p class="empty">검색된 뉴스가 없습니다.</p>'
     return f"""
     <details class="topic" open>
       <summary>
@@ -50,16 +53,9 @@ def section_html(title: str, stories: list[app.Story]) -> str:
 
 def build_page(topics: dict[str, list[app.Story]], generated_at: datetime) -> str:
     total = sum(len(stories) for stories in topics.values())
-    if topics:
-        sections = "".join(
-            section_html(title, stories) for title, stories in topics.items()
-        )
-    else:
-        sections = """
-    <details class="topic" open>
-      <summary><span>새 뉴스</span><span class="count">0건</span></summary>
-      <div class="articles"><p class="empty">보고할 새 뉴스가 없습니다.</p></div>
-    </details>"""
+    sections = "".join(
+        section_html(title, stories) for title, stories in topics.items()
+    )
     updated = html.escape(generated_at.astimezone(KST).strftime("%Y년 %m월 %d일 %H:%M KST"))
     return f"""<!doctype html>
 <html lang="ko">
