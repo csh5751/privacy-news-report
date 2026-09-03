@@ -171,6 +171,103 @@ class CandidateSelectionTests(unittest.TestCase):
         self.assertFalse(app.same_story(left, right))
 
 
+class RelevanceTests(unittest.TestCase):
+    def setUp(self):
+        self.now = datetime(2026, 9, 3, 1, 0, tzinfo=timezone.utc)
+
+    def test_promotional_articles_score_below_real_incidents(self):
+        incident = article(
+            "티빙, 개인정보 유출 공식 사과…피해 보상안 발표", "https://a.test/1", self.now
+        )
+        promo = article(
+            "파수 AI, 가상화 방식의 소스코드 보안 솔루션 출시", "https://a.test/2", self.now
+        )
+        event = article(
+            "기업 AI ROI, 해법 찾는다…'NABS 2026' 개최", "https://a.test/3", self.now
+        )
+
+        self.assertGreaterEqual(app.relevance_score(incident), 1)
+        self.assertLess(app.relevance_score(promo), 1)
+        self.assertLess(app.relevance_score(event), 1)
+
+    def test_blog_and_cafe_posts_are_dropped(self):
+        blog = article(
+            "티빙, 쿠팡 과징금 유탄 맞나 : 네이버 블로그",
+            "https://blog.naver.com/x",
+            self.now,
+            "네이버 블로그",
+        )
+        news = article(
+            "개인정보위, 쿠팡에 과징금 부과", "https://www.yna.co.kr/1", self.now, "연합뉴스"
+        )
+
+        self.assertTrue(app.is_user_generated(blog))
+        self.assertFalse(app.is_user_generated(news))
+        self.assertEqual([news], app.filter_relevant([blog, news]))
+
+    def test_filter_is_skipped_when_it_would_empty_the_pool(self):
+        # 신호어가 현실을 못 따라가도 후보를 통째로 날리면 안 된다.
+        unmatched = [
+            article(f"홍보성 제목 {index} 출시", f"https://a.test/{index}", self.now)
+            for index in range(10)
+        ]
+
+        self.assertEqual(unmatched, app.filter_relevant(unmatched))
+
+
+class ClusteringTests(unittest.TestCase):
+    def setUp(self):
+        self.now = datetime(2026, 9, 3, 1, 0, tzinfo=timezone.utc)
+
+    def variants(self) -> list[app.Article]:
+        titles = [
+            "네이버, 독자 '사이버보안 AI 모델' 개발…정부 사업 선정",
+            "정부 보안특화 AI 모델 개발 사업자로 네이버 선정",
+            "네이버클라우드, 과기정통부 사이버보안 AI 개발 사업 선정",
+            "네이버클라우드, SKT 제치고 '보안 특화 AI' 개발 사업자 선정",
+        ]
+        return [
+            article(title, f"https://a.test/{index}", self.now)
+            for index, title in enumerate(titles)
+        ]
+
+    def test_one_event_reported_by_many_outlets_forms_a_single_cluster(self):
+        clusters = app.cluster_stories(self.variants())
+
+        self.assertEqual(1, len(clusters))
+        self.assertEqual(4, len(clusters[0]))
+
+    def test_common_words_alone_do_not_merge_distinct_events(self):
+        # "보안"과 "AI"만 겹치는 서로 다른 사건은 묶이지 않아야 한다.
+        left = article("보안 AI 모델 개발 사업자 선정", "https://a.test/1", self.now)
+        right = article("보안 AI 시장 규모 전망 발표", "https://a.test/2", self.now)
+        filler = [
+            article(f"보안 AI 관련 소식 {i}", f"https://a.test/f{i}", self.now)
+            for i in range(8)
+        ]
+
+        weights = app.token_weights([left, right, *filler])
+
+        self.assertFalse(app.same_story(left, right, weights))
+
+    def test_coverage_count_drives_heuristic_importance(self):
+        self.assertEqual(5, app.coverage_importance(15))
+        self.assertEqual(4, app.coverage_importance(5))
+        self.assertEqual(3, app.coverage_importance(3))
+        self.assertEqual(1, app.coverage_importance(1))
+
+    def test_widely_covered_event_outranks_a_newer_single_report(self):
+        widely_covered = self.variants()
+        lone_but_newer = article(
+            "단독 보도 한 건", "https://a.test/9", self.now + timedelta(hours=2)
+        )
+
+        stories = app.curate_heuristically([*widely_covered, lone_but_newer], limit=5)
+
+        self.assertEqual(4, len(stories[0].articles))
+        self.assertGreater(stories[0].importance, stories[-1].importance)
+
+
 class CurationTests(unittest.TestCase):
     def setUp(self):
         self.now = datetime(2026, 9, 2, 1, 0, tzinfo=timezone.utc)

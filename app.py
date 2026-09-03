@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import html
 import json
+import math
 import os
 import re
 import ssl
@@ -53,9 +54,32 @@ STORY_STOPWORDS = {
     "ai", "개인정보", "개인정보보호", "보호", "관련", "대한", "위한",
     "시대", "뉴스", "최신", "진행", "개최", "밝혔다",
 }
+# 같은 사건으로 볼 제목 유사도. IDF 가중 기준이라 흔한 단어만 겹쳐도 묶이지 않는다.
+STORY_MATCH_RATIO = 0.45
+# 개인정보·보안 사건임을 알려주는 표현. 하나 걸릴 때마다 점수를 올린다.
+RELEVANCE_SIGNALS = (
+    "유출", "해킹", "침해", "과징금", "제재", "처분", "시정명령", "시정조치",
+    "조사", "의결", "고시", "시행령", "개정", "입법", "취약점", "랜섬웨어",
+    "피싱", "스미싱", "악성코드", "디도스", "위반", "집단소송", "손해배상",
+    "보상안", "사과", "개인정보", "프라이버시", "정보보호", "가명정보",
+    "마이데이터", "cpo", "gdpr", "개보위", "감독", "보안사고", "정보통신망법",
+    # 보안 자체가 주제인 기사도 남긴다. 홍보성 기사는 아래 노이즈 점수로 걸러진다.
+    "보안", "사이버", "암호화", "인증", "사찰", "감시",
+)
+# 홍보·시장 뉴스 표현. 신호가 없으면 이쪽이 걸린 기사는 걸러낸다.
+RELEVANCE_NOISE = (
+    "출시", "선보", "실적", "매출", "영업이익", "주가", "수주", "협약", "mou",
+    "수상", "임명", "채용", "세미나", "컨퍼런스", "웨비나", "공모전", "이벤트",
+    "할인", "프로모션", "솔루션", "간담회", "포럼", "박람회", "출범", "체결",
+)
+RELEVANCE_MIN_SCORE = 1
+# 필터가 후보를 이만큼 아래로 깎으면 신호어 목록이 현실을 못 따라간 것으로 보고 되돌린다.
+RELEVANCE_MIN_KEPT_RATIO = 0.15
 # Bing 피드는 관련도 순으로 12건 남짓만 돌려주므로 Google 피드로 최신 기사를 보충한다.
 DEFAULT_WINDOW_HOURS = 30
-CURATION_MODEL = "claude-opus-5"
+# 관련성 판단과 사건 묶기는 분류에 가까운 작업이라 상위 모델이 필요하지 않다.
+# 이 모델은 adaptive thinking과 effort를 지원하지 않으므로(4.6 이후 기능) 보내지 않는다.
+CURATION_MODEL = "claude-haiku-4-5"
 CURATION_MAX_CANDIDATES = 400
 CURATION_DESCRIPTION_LIMIT = 200
 CURATION_MAX_TOKENS = 16_000
@@ -70,6 +94,8 @@ SOURCE_TIERS = (
     (75, ("뉴스1", "뉴시스", "이투데이", "아시아투데이")),
 )
 AGGREGATOR_HOSTS = ("msn.com", "news.nate.com", "zum.com")
+# 개인 블로그·카페 글은 언론 보도가 아니므로 후보에서 제외한다.
+UGC_SOURCE_TERMS = ("블로그", "카페", "브런치", "blog", "tistory", "brunch")
 T = TypeVar("T")
 
 
@@ -626,14 +652,75 @@ def story_tokens(value: str) -> set[str]:
     }
 
 
-def same_story(left: Article, right: Article) -> bool:
-    """서로 다른 언론사의 기사가 같은 사건을 다루는지 휴리스틱으로 판단한다."""
+def is_user_generated(article: Article) -> bool:
+    """개인 블로그·카페 글인지 판단한다."""
+    haystack = f"{article.source} {article.title} {urlparse(article.link).hostname or ''}"
+    return any(term in haystack.casefold() for term in UGC_SOURCE_TERMS)
+
+
+def relevance_score(article: Article) -> int:
+    """개인정보·보안 사건일 가능성을 점수로 매긴다. 높을수록 관련도가 높다."""
+    text = f"{article.title} {article.description}".casefold()
+    signals = sum(1 for term in RELEVANCE_SIGNALS if term in text)
+    noise = sum(1 for term in RELEVANCE_NOISE if term in text)
+    return signals * 2 - noise
+
+
+def filter_relevant(articles: list[Article]) -> list[Article]:
+    """홍보·시장 뉴스를 걸러낸다. 너무 많이 걸러지면 원본을 그대로 둔다."""
+    if not articles:
+        return []
+    news = [article for article in articles if not is_user_generated(article)]
+    kept = [
+        article for article in news if relevance_score(article) >= RELEVANCE_MIN_SCORE
+    ]
+    if len(kept) < len(articles) * RELEVANCE_MIN_KEPT_RATIO:
+        print(
+            f"[관련성] {len(articles)}건 중 {len(kept)}건만 남아 필터를 건너뜁니다. "
+            "신호어 목록을 점검하세요.",
+            file=sys.stderr,
+        )
+        return articles
+    print(f"[관련성] {len(articles)}건 → {len(kept)}건")
+    return kept
+
+
+def token_weights(articles: Iterable[Article]) -> dict[str, float]:
+    """후보 전체에서 흔한 단어의 비중을 낮추는 IDF 가중치를 만든다.
+
+    "보안", "AI", "정부"처럼 검색 키워드 때문에 어디에나 나오는 단어는
+    사건을 구분하지 못한다. 반대로 "네이버클라우드", "독파모"처럼 드문 단어가
+    같은 사건임을 알려주므로 그쪽에 무게를 준다.
+    """
+    titles = [story_tokens(article.title) for article in articles]
+    total = len(titles)
+    if not total:
+        return {}
+    frequency: dict[str, int] = {}
+    for tokens in titles:
+        for token in tokens:
+            frequency[token] = frequency.get(token, 0) + 1
+    return {
+        token: math.log(total / (1 + count)) + 1.0
+        for token, count in frequency.items()
+    }
+
+
+def same_story(
+    left: Article, right: Article, weights: dict[str, float] | None = None
+) -> bool:
+    """서로 다른 언론사의 기사가 같은 사건을 다루는지 판단한다."""
     left_title = story_tokens(left.title)
     right_title = story_tokens(right.title)
     shared_title = left_title & right_title
-    smaller_title = min(len(left_title), len(right_title))
-    if smaller_title and len(shared_title) >= 2:
-        if len(shared_title) / smaller_title >= 0.6:
+    if shared_title:
+        scale = weights or {}
+
+        def mass(tokens: set[str]) -> float:
+            return sum(scale.get(token, 1.0) for token in tokens)
+
+        smaller = min(mass(left_title), mass(right_title))
+        if smaller and mass(shared_title) / smaller >= STORY_MATCH_RATIO:
             return True
 
     normalized_left = "".join(STORY_TOKEN_RE.findall(left.title)).casefold()
@@ -674,10 +761,12 @@ def representative_score(article: Article) -> tuple[int, int, float]:
 
 def cluster_stories(articles: Iterable[Article]) -> list[list[Article]]:
     """제목·본문 유사도로 같은 사건을 다룬 기사들을 묶는다."""
+    pool = list(articles)
+    weights = token_weights(pool)
     clusters: list[list[Article]] = []
-    for article in articles:
+    for article in pool:
         for cluster in clusters:
-            if any(same_story(article, existing) for existing in cluster):
+            if any(same_story(article, existing, weights) for existing in cluster):
                 cluster.append(article)
                 break
         else:
@@ -904,7 +993,6 @@ def curate_with_claude(
             model=model,
             max_tokens=CURATION_MAX_TOKENS,
             system=CURATION_SYSTEM_PROMPT,
-            thinking={"type": "adaptive"},
             output_config={
                 "format": {"type": "json_schema", "schema": CURATION_SCHEMA}
             },
@@ -938,8 +1026,20 @@ def curate_with_claude(
     return build_stories(payload, candidates, limit)
 
 
+def coverage_importance(outlets: int) -> int:
+    """몇 개 언론사가 보도했는지로 중요도를 어림한다.
+
+    여러 매체가 같은 사건을 동시에 다루면 그만큼 사안이 크다는 뜻이다.
+    모델 없이 쓸 수 있는 신호 중에서는 최신순보다 훨씬 쓸모 있다.
+    """
+    for threshold, score in ((10, 5), (5, 4), (3, 3), (2, 2)):
+        if outlets >= threshold:
+            return score
+    return 1
+
+
 def curate_heuristically(articles: list[Article], limit: int) -> list[Story]:
-    """Claude를 쓸 수 없을 때 기존 휴리스틱으로 사건을 묶는다."""
+    """Claude를 쓸 수 없을 때 휴리스틱으로 사건을 묶고 순위를 매긴다."""
     stories: list[Story] = []
     for cluster in cluster_stories(articles):
         representative = max(cluster, key=representative_score)
@@ -949,15 +1049,19 @@ def curate_heuristically(articles: list[Article], limit: int) -> list[Story]:
                 section="",
                 headline=representative.title,
                 summary=summarize(representative, max_length=200),
-                importance=3,
+                importance=coverage_importance(len(cluster)),
                 representative=representative,
                 related=related,
             )
         )
 
+    # 보도량이 많은 사건을 먼저, 같으면 최신순으로 고른다.
     stories.sort(
-        key=lambda story: story.representative.published
-        or datetime.min.replace(tzinfo=timezone.utc),
+        key=lambda story: (
+            story.importance,
+            story.representative.published
+            or datetime.min.replace(tzinfo=timezone.utc),
+        ),
         reverse=True,
     )
     return stories[:limit]
@@ -992,11 +1096,22 @@ OTHER_SECTION = "기타"
 
 
 def story_section(story: Story, keywords: list[str]) -> str:
-    """사건이 속할 구획을 정한다. 여러 키워드에 걸리면 앞선 키워드를 쓴다."""
-    found = {
-        keyword for article in story.articles for keyword in article.keywords
-    }
-    return next((keyword for keyword in keywords if keyword in found), OTHER_SECTION)
+    """사건이 속할 구획을 정한다.
+
+    여러 키워드에 걸리면 그 사건을 가장 많이 찾아낸 키워드를 쓴다. 키워드
+    순서만으로 정하면 목록 앞에 있는 키워드가 무관한 사건까지 가져간다.
+    """
+    hits: dict[str, int] = {}
+    for article in story.articles:
+        for keyword in article.keywords:
+            hits[keyword] = hits.get(keyword, 0) + 1
+    if not hits:
+        return OTHER_SECTION
+    ranked = [keyword for keyword in keywords if keyword in hits]
+    if not ranked:
+        return OTHER_SECTION
+    # 동률이면 키워드를 준 순서를 따른다.
+    return max(ranked, key=lambda keyword: (hits[keyword], -keywords.index(keyword)))
 
 
 def group_sections(
@@ -1418,7 +1533,7 @@ def collect_candidates(
     print(
         f"[후보] 수집 {len(pool)}건 → 최근 {window_hours}시간 내 신규 {len(candidates)}건"
     )
-    return candidates, failures
+    return filter_relevant(candidates), failures
 
 
 def build_report(
