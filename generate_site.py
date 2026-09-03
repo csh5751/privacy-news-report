@@ -93,7 +93,7 @@ def build_page(
     header h1 {{ margin: 0 0 12px; font-size: clamp(1.8rem, 5vw, 3rem); line-height: 1.2; letter-spacing: -.04em; }}
     header p {{ margin: 0; color: #dbeafe; }}
     .stats {{ display: flex; gap: 10px; flex-wrap: wrap; margin-top: 22px; }}
-    .notice {{ max-width: 74ch; margin-top: 18px; padding-left: 12px; border-left: 2px solid rgba(255,255,255,.3); color: #dbeafe; font-size: .8rem; line-height: 1.6; }}
+    .notice {{ margin-top: 18px; padding-left: 12px; border-left: 2px solid rgba(255,255,255,.3); color: #dbeafe; font-size: .8rem; line-height: 1.6; text-wrap: pretty; }}
     .notice p {{ margin: 0 0 4px; }}
     .notice p:last-child {{ margin-bottom: 0; }}
     .badge {{ padding: 7px 12px; border: 1px solid rgba(255,255,255,.25); border-radius: 999px; background: rgba(255,255,255,.12); font-size: .9rem; }}

@@ -1304,10 +1304,10 @@ def notice_lines(stats: RunStats) -> list[str]:
             "관련성 판단이 들어가지 않아 무관한 기사가 섞일 수 있습니다."
         )
     else:
+        # 한 줄에 들어가도록 짧게 쓴다. 길어지면 PC 화면에서 단어 몇 개만 다음 줄로 넘어간다.
         second = (
-            f"{curator_label(stats.curator)}가 기사별 관련성을 판단하고, "
-            "여러 매체가 같은 사건을 보도한 건을 하나로 묶어 대표 기사를 고르고, "
-            "중요도와 요약을 매겼습니다."
+            f"{curator_label(stats.curator)}가 관련성을 판단해 무관한 기사를 걸러내고, "
+            "같은 사건 보도를 하나로 묶어 대표 기사·중요도·요약을 정했습니다."
         )
     lines = [first, second]
     if stats.failed_keywords:
