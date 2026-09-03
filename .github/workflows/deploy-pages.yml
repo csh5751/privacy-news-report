@@ -2,6 +2,9 @@ name: Update News Report
 
 on:
   workflow_dispatch:
+  # 코드를 고치면 바로 반영한다. 이게 없으면 다음 예약 실행까지 낡은 페이지가 남는다.
+  push:
+    branches: [main]
   schedule:
     # GitHub cron은 UTC 기준: 23:40 UTC = 다음 날 08:40 KST
     - cron: "40 23 * * *"

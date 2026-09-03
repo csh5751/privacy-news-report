@@ -12,6 +12,7 @@ import app
 
 
 KST = timezone(timedelta(hours=9))
+DEFAULT_STORY_LIMIT = 30
 
 
 def story_html(story: app.Story) -> str:
@@ -148,7 +149,11 @@ def build_page(
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="GitHub Pages용 뉴스 보고서를 생성합니다.")
     parser.add_argument("keywords", nargs="*", help="검색 키워드. 생략하면 app.py 기본값 사용")
-    parser.add_argument("-n", "--limit", type=int, default=12, help="보고서 전체 사건 수")
+    # HTML 보고서는 Teams처럼 본문 크기 제한이 없고 전송 이력으로 걸러내지도 않는다.
+    # 브리핑이 요약이라면 이 페이지는 그날 전체를 훑어보는 곳이라 더 많이 담는다.
+    parser.add_argument(
+        "-n", "--limit", type=int, default=DEFAULT_STORY_LIMIT, help="보고서 전체 사건 수"
+    )
     parser.add_argument("--timeout", type=float, default=20.0, help="요청 제한 시간(초)")
     parser.add_argument(
         "--window-hours",
