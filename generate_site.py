@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import html
+import os
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -193,6 +194,15 @@ def main(argv: list[str] | None = None) -> int:
     )
     for line in app.notice_lines(stats):
         print(f"[안내] {line}")
+
+    # 시크릿이 빠지면 페이지가 조용히 규칙 기반으로 만들어져 며칠이고 방치될 수 있다.
+    # 배포는 그대로 진행하되, Actions 실행 목록에 경고를 남겨 눈에 띄게 한다.
+    if stats.curator == app.HEURISTIC_CURATOR and os.environ.get("GITHUB_ACTIONS"):
+        print(
+            "::warning title=큐레이션 폴백::"
+            "Claude 큐레이션 없이 규칙 기반으로 보고서를 만들었습니다. "
+            "ANTHROPIC_API_KEY와 ANTHROPIC_WORKSPACE_ID 시크릿을 확인하세요."
+        )
 
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
