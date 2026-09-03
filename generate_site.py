@@ -51,11 +51,23 @@ def section_html(title: str, stories: list[app.Story]) -> str:
     </details>"""
 
 
-def build_page(topics: dict[str, list[app.Story]], generated_at: datetime) -> str:
+def notice_html(stats: app.RunStats | None) -> str:
+    if stats is None:
+        return ""
+    lines = "".join(f"<p>{html.escape(line)}</p>" for line in app.notice_lines(stats))
+    return f'\n      <div class="notice">{lines}</div>'
+
+
+def build_page(
+    topics: dict[str, list[app.Story]],
+    generated_at: datetime,
+    stats: app.RunStats | None = None,
+) -> str:
     total = sum(len(stories) for stories in topics.values())
     sections = "".join(
         section_html(title, stories) for title, stories in topics.items()
     )
+    notice = notice_html(stats)
     updated = html.escape(generated_at.astimezone(KST).strftime("%Y년 %m월 %d일 %H:%M KST"))
     return f"""<!doctype html>
 <html lang="ko">
@@ -79,6 +91,9 @@ def build_page(topics: dict[str, list[app.Story]], generated_at: datetime) -> st
     header h1 {{ margin: 0 0 12px; font-size: clamp(1.8rem, 5vw, 3rem); line-height: 1.2; letter-spacing: -.04em; }}
     header p {{ margin: 0; color: #dbeafe; }}
     .stats {{ display: flex; gap: 10px; flex-wrap: wrap; margin-top: 22px; }}
+    .notice {{ max-width: 74ch; margin-top: 18px; padding-left: 12px; border-left: 2px solid rgba(255,255,255,.3); color: #dbeafe; font-size: .8rem; line-height: 1.6; }}
+    .notice p {{ margin: 0 0 4px; }}
+    .notice p:last-child {{ margin-bottom: 0; }}
     .badge {{ padding: 7px 12px; border: 1px solid rgba(255,255,255,.25); border-radius: 999px; background: rgba(255,255,255,.12); font-size: .9rem; }}
     main {{ padding: 28px 0 56px; }}
     .topic {{ margin-bottom: 18px; overflow: hidden; border: 1px solid var(--line); border-radius: 18px; background: var(--surface); box-shadow: var(--shadow); }}
@@ -119,7 +134,7 @@ def build_page(topics: dict[str, list[app.Story]], generated_at: datetime) -> st
         <span class="badge">주제 {len(topics)}개</span>
         <span class="badge">사건 {total}건</span>
         <span class="badge">업데이트 {updated}</span>
-      </div>
+      </div>{notice}
     </div>
   </header>
   <main class="wrap">{sections}
@@ -168,18 +183,19 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     # 보고서는 전체 현황을 보여주는 페이지라 전송 이력으로 걸러내지 않는다.
-    sections, failures = app.build_report(
+    sections, stats = app.build_report(
         keywords, args.limit, args.timeout, args.window_hours, api_key
     )
+    for line in app.notice_lines(stats):
+        print(f"[안내] {line}")
 
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(
-        build_page(sections, datetime.now(timezone.utc)), encoding="utf-8"
+        build_page(sections, datetime.now(timezone.utc), stats), encoding="utf-8"
     )
-    total = sum(len(stories) for stories in sections.values())
-    print(f"[완료] {output.resolve()} ({total}건)")
-    return 1 if keywords and failures == len(keywords) else 0
+    print(f"[완료] {output.resolve()} ({stats.stories}건)")
+    return 1 if keywords and stats.failed_keywords == len(keywords) else 0
 
 
 if __name__ == "__main__":

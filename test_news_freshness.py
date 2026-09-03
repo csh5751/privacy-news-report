@@ -380,22 +380,44 @@ class CurationTests(unittest.TestCase):
 
         app.curate_with_claude = boom
         try:
-            stories = app.curate(self.candidates, limit=12, api_key="test-key")
+            stories, curator = app.curate(
+                self.candidates, limit=12, api_key="test-key"
+            )
         finally:
             app.curate_with_claude = original
 
         self.assertTrue(stories)
+        # 폴백으로 정리했으면 안내에 모델이 처리했다고 적히지 않아야 한다.
+        self.assertEqual(app.HEURISTIC_CURATOR, curator)
+
+    def test_curate_reports_the_model_when_it_succeeds(self):
+        original = app.curate_with_claude
+        expected = app.build_stories(self.payload(), self.candidates, limit=12)
+        app.curate_with_claude = lambda *args, **kwargs: expected
+        try:
+            stories, curator = app.curate(
+                self.candidates, limit=12, api_key="test-key"
+            )
+        finally:
+            app.curate_with_claude = original
+
+        self.assertEqual(expected, stories)
+        self.assertEqual(app.CURATION_MODEL, curator)
 
     def test_curate_uses_heuristics_without_an_api_key(self):
-        stories = app.curate(self.candidates, limit=12, api_key=None)
+        stories, curator = app.curate(self.candidates, limit=12, api_key=None)
 
         self.assertTrue(stories)
+        self.assertEqual(app.HEURISTIC_CURATOR, curator)
         # 유사한 제목의 두 기사는 한 사건으로 묶이고 신뢰도 높은 쪽이 대표가 된다.
         merged = next(story for story in stories if story.related)
         self.assertEqual("연합뉴스", merged.representative.source)
 
     def test_curate_returns_nothing_for_an_empty_pool(self):
-        self.assertEqual([], app.curate([], limit=12, api_key="test-key"))
+        stories, curator = app.curate([], limit=12, api_key="test-key")
+
+        self.assertEqual([], stories)
+        self.assertEqual(app.HEURISTIC_CURATOR, curator)
 
     def test_group_sections_uses_keyword_order_and_keeps_empty_keywords(self):
         stories = app.build_stories(self.payload(), self.candidates, limit=12)
@@ -527,6 +549,79 @@ class OutputTests(unittest.TestCase):
         self.assertIn("1개 주제", text)
         self.assertIn("새 사건 1건", text)
         self.assertLessEqual(len(text), 200)
+
+
+class NoticeTests(unittest.TestCase):
+    def stats(self, **overrides) -> app.RunStats:
+        values = {
+            "collected": 354,
+            "fresh": 195,
+            "already_sent": 24,
+            "irrelevant": 39,
+            "folded": 130,
+            "stories": 12,
+            "curator": app.CURATION_MODEL,
+        }
+        values.update(overrides)
+        return app.RunStats(**values)
+
+    def test_notice_reports_what_was_left_out_and_who_curated(self):
+        lines = app.notice_lines(self.stats())
+
+        self.assertIn("수집 354건", lines[0])
+        self.assertIn("사건 12건", lines[0])
+        self.assertIn("이미 보낸 24건", lines[0])
+        self.assertIn("관련 없는 39건", lines[0])
+        self.assertIn("같은 사건 중복 보도 130건", lines[0])
+        self.assertIn("Claude Haiku 4.5", lines[1])
+
+    def test_notice_does_not_credit_the_model_on_a_fallback_run(self):
+        lines = app.notice_lines(self.stats(curator=app.HEURISTIC_CURATOR))
+        text = " ".join(lines)
+
+        self.assertNotIn("Claude", text)
+        self.assertNotIn("Haiku", text)
+        self.assertIn("규칙 기반", text)
+
+    def test_notice_omits_counts_that_are_zero(self):
+        lines = app.notice_lines(
+            self.stats(already_sent=0, irrelevant=0, folded=0)
+        )
+
+        self.assertNotIn("이미 보낸", lines[0])
+        self.assertNotIn("관련 없는", lines[0])
+        self.assertNotIn("중복 보도", lines[0])
+
+    def test_notice_mentions_failed_keywords(self):
+        self.assertNotIn(
+            "수집에 실패", " ".join(app.notice_lines(self.stats()))
+        )
+        self.assertIn(
+            "주제 2개는 수집에 실패",
+            " ".join(app.notice_lines(self.stats(failed_keywords=2))),
+        )
+
+    def test_teams_message_puts_the_notice_above_the_first_section(self):
+        now = datetime(2026, 9, 3, 1, 0, tzinfo=timezone.utc)
+        story = app.Story(
+            section="개인정보 유출 사고",
+            headline="티빙, 개인정보 유출 공식 사과",
+            summary="사과했다.",
+            importance=5,
+            representative=article("티빙 사과", "https://a.test/1", now, "한국일보"),
+        )
+
+        text = app.build_teams_message(
+            {"개인정보 유출 사고": [story]}, self.stats()
+        )["text"]
+
+        self.assertIn("Claude Haiku 4.5", text)
+        self.assertLess(text.index("Claude Haiku 4.5"), text.index("<h3>"))
+
+    def test_teams_message_without_stats_has_no_notice(self):
+        text = app.build_teams_message({})["text"]
+
+        self.assertNotIn("Claude", text)
 
 
 class RetryTests(unittest.TestCase):

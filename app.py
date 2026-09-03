@@ -129,6 +129,20 @@ class Story:
 
 
 @dataclass(frozen=True)
+class RunStats:
+    """한 번의 실행에서 후보가 어떻게 걸러졌는지 기록한다."""
+
+    collected: int = 0
+    fresh: int = 0
+    already_sent: int = 0
+    irrelevant: int = 0
+    folded: int = 0
+    stories: int = 0
+    curator: str = ""
+    failed_keywords: int = 0
+
+
+@dataclass(frozen=True)
 class KakaoConfig:
     rest_api_key: str
     client_secret: str
@@ -1067,29 +1081,37 @@ def curate_heuristically(articles: list[Article], limit: int) -> list[Story]:
     return stories[:limit]
 
 
+HEURISTIC_CURATOR = "규칙 기반 정리"
+
+
 def curate(
     articles: list[Article],
     limit: int,
     api_key: str | None,
-) -> list[Story]:
-    """Claude 큐레이션을 시도하고 실패하면 휴리스틱으로 되돌린다."""
+) -> tuple[list[Story], str]:
+    """Claude 큐레이션을 시도하고 실패하면 휴리스틱으로 되돌린다.
+
+    반환값의 두 번째 항목은 실제로 어느 방식이 쓰였는지를 나타낸다. 보고서에
+    표시할 안내가 사실과 어긋나지 않도록 호출한 쪽이 이 값을 그대로 써야 한다.
+    """
     if not articles:
-        return []
+        return [], HEURISTIC_CURATOR
     if not api_key:
         print("[큐레이션] API 키가 없어 휴리스틱으로 정리합니다.", file=sys.stderr)
-        return curate_heuristically(articles, limit)
+        return curate_heuristically(articles, limit), HEURISTIC_CURATOR
     try:
-        return retry_operation(
+        stories = retry_operation(
             "Claude 큐레이션",
             lambda: curate_with_claude(articles, limit, api_key),
             attempts=2,
         )
+        return stories, CURATION_MODEL
     except RuntimeError as exc:
         print(
             f"[큐레이션] Claude 정리에 실패해 휴리스틱으로 대체합니다: {exc}",
             file=sys.stderr,
         )
-        return curate_heuristically(articles, limit)
+        return curate_heuristically(articles, limit), HEURISTIC_CURATOR
 
 
 OTHER_SECTION = "기타"
@@ -1192,6 +1214,48 @@ def format_date(value: datetime | None) -> str:
     return korea_time.strftime("%Y-%m-%d %H:%M KST")
 
 
+CURATOR_LABELS = {"claude-haiku-4-5": "Claude Haiku 4.5"}
+
+
+def curator_label(curator: str) -> str:
+    return CURATOR_LABELS.get(curator, curator or HEURISTIC_CURATOR)
+
+
+def notice_lines(stats: RunStats) -> list[str]:
+    """보고서 최상단에 넣을 처리 내역 안내를 만든다.
+
+    폴백으로 정리된 실행에 모델이 처리했다고 적으면 안 되므로, 실제로 쓰인
+    큐레이터를 그대로 적는다.
+    """
+    trimmed: list[str] = []
+    if stats.already_sent:
+        trimmed.append(f"이미 보낸 {stats.already_sent}건")
+    if stats.irrelevant:
+        trimmed.append(f"관련 없는 {stats.irrelevant}건")
+    if stats.folded:
+        trimmed.append(f"같은 사건 중복 보도 {stats.folded}건")
+
+    first = f"수집 {stats.collected}건 → 사건 {stats.stories}건"
+    if trimmed:
+        first += f" · {', '.join(trimmed)}을 빼고 정리했습니다."
+
+    if stats.curator == HEURISTIC_CURATOR:
+        second = (
+            "모델을 쓸 수 없어 규칙 기반으로 정리했습니다. "
+            "관련성 판단이 들어가지 않아 무관한 기사가 섞일 수 있습니다."
+        )
+    else:
+        second = (
+            f"{curator_label(stats.curator)}가 기사별 관련성을 판단하고, "
+            "여러 매체가 같은 사건을 보도한 건을 하나로 묶어 대표 기사를 고르고, "
+            "중요도와 요약을 매겼습니다."
+        )
+    lines = [first, second]
+    if stats.failed_keywords:
+        lines.append(f"주제 {stats.failed_keywords}개는 수집에 실패했습니다.")
+    return lines
+
+
 def story_summary(story: Story, max_length: int = 200) -> str:
     """큐레이션 요약이 없으면 원문 설명에서 뽑아 쓴다."""
     if story.summary:
@@ -1216,7 +1280,9 @@ def display_sections(sections: dict[str, list[Story]]) -> None:
                 print(f"   관련 보도 {len(story.related)}건: {names}")
 
 
-def build_teams_message(sections: dict[str, list[Story]]) -> dict[str, str]:
+def build_teams_message(
+    sections: dict[str, list[Story]], stats: RunStats | None = None
+) -> dict[str, str]:
     """큐레이션한 구획 전체를 Teams 일반 메시지용 HTML 본문 하나로 만든다."""
     collected_at = datetime.now(KST).strftime("%Y-%m-%d %H:%M KST")
     total = sum(len(stories) for stories in sections.values())
@@ -1224,6 +1290,9 @@ def build_teams_message(sections: dict[str, list[Story]]) -> dict[str, str]:
         "<h2>📰 개인정보 보호 · AI 보안 뉴스 브리핑</h2>",
         f"<p><em>수집 시각: {html.escape(collected_at)} · 새 사건 {total}건</em></p>",
     ]
+    if stats is not None:
+        notice = "<br>".join(html.escape(line) for line in notice_lines(stats))
+        lines.append(f"<blockquote><small>{notice}</small></blockquote>")
     if not total:
         lines.append("<p>보고할 새 뉴스가 없습니다.</p>")
         return {"text": "".join(lines)}
@@ -1268,10 +1337,11 @@ def send_to_teams(
     webhook_url: str,
     sections: dict[str, list[Story]],
     timeout: float,
+    stats: RunStats | None = None,
 ) -> None:
     """큐레이션한 뉴스가 담긴 일반 메시지 하나를 Teams로 전송한다."""
     data = json.dumps(
-        build_teams_message(sections), ensure_ascii=False
+        build_teams_message(sections, stats), ensure_ascii=False
     ).encode("utf-8")
     if len(data) > TEAMS_MAX_PAYLOAD_BYTES:
         raise RuntimeError(
@@ -1507,9 +1577,8 @@ def collect_candidates(
     keywords: list[str],
     timeout: float,
     window_hours: int,
-    excluded_keys: set[str],
 ) -> tuple[list[Article], int]:
-    """모든 키워드의 후보 기사를 하나의 풀로 모은다. 반환값은 (후보, 실패 키워드 수)."""
+    """모든 키워드의 기사를 하나의 풀로 모은다. 반환값은 (기사, 실패 키워드 수)."""
     pool: list[Article] = []
     failures = 0
     for keyword in keywords:
@@ -1526,14 +1595,7 @@ def collect_candidates(
         except RuntimeError as exc:
             failures += 1
             print(f"[경고] {keyword}: {exc}", file=sys.stderr)
-
-    candidates = select_recent_articles(
-        pool, window_hours=window_hours, excluded_keys=excluded_keys
-    )
-    print(
-        f"[후보] 수집 {len(pool)}건 → 최근 {window_hours}시간 내 신규 {len(candidates)}건"
-    )
-    return filter_relevant(candidates), failures
+    return pool, failures
 
 
 def build_report(
@@ -1543,16 +1605,41 @@ def build_report(
     window_hours: int,
     api_key: str | None,
     excluded_keys: set[str] | None = None,
-) -> tuple[dict[str, list[Story]], int]:
-    """후보를 모아 큐레이션한 구획을 만든다. 반환값은 (구획, 실패 키워드 수)."""
-    candidates, failures = collect_candidates(
-        keywords, timeout, window_hours, excluded_keys or set()
+) -> tuple[dict[str, list[Story]], RunStats]:
+    """후보를 모아 큐레이션한 구획과 처리 내역을 만든다."""
+    pool, failures = collect_candidates(keywords, timeout, window_hours)
+    excluded = excluded_keys or set()
+
+    # 이력으로 제외된 건수를 안내에 쓰려고 걸러내기 전후를 함께 센다.
+    fresh = select_recent_articles(pool, window_hours=window_hours)
+    candidates = (
+        select_recent_articles(
+            pool, window_hours=window_hours, excluded_keys=excluded
+        )
+        if excluded
+        else fresh
     )
-    stories = curate(candidates, limit, api_key)
+    print(
+        f"[후보] 수집 {len(pool)}건 → 최근 {window_hours}시간 내 신규 {len(candidates)}건"
+    )
+
+    relevant = filter_relevant(candidates)
+    stories, curator = curate(relevant, limit, api_key)
     sections = group_sections(stories, keywords)
     filled = sum(1 for entries in sections.values() if entries)
-    print(f"[정리] 구획 {filled}/{len(sections)}개 · 사건 {len(stories)}건")
-    return sections, failures
+    reported = [story for entries in sections.values() for story in entries]
+    stats = RunStats(
+        collected=len(pool),
+        fresh=len(fresh),
+        already_sent=len(fresh) - len(candidates),
+        irrelevant=len(candidates) - len(relevant),
+        folded=sum(len(story.articles) for story in reported) - len(reported),
+        stories=len(reported),
+        curator=curator,
+        failed_keywords=failures,
+    )
+    print(f"[정리] 구획 {filled}/{len(sections)}개 · 사건 {stats.stories}건")
+    return sections, stats
 
 
 def run_news_cycle(
@@ -1567,10 +1654,13 @@ def run_news_cycle(
     """뉴스 수집·큐레이션과 콘솔 출력 및 Teams 전송을 한 차례 수행한다."""
     print(f"{', '.join(keywords)} 주제의 새 뉴스를 가져오는 중입니다...")
     history = load_sent_history()
-    sections, failures = build_report(
+    sections, stats = build_report(
         keywords, limit, timeout, window_hours, api_key, set(history)
     )
+    failures = stats.failed_keywords
     display_sections(sections)
+    for line in notice_lines(stats):
+        print(f"[안내] {line}")
 
     reported_keys: set[str] = set()
     total = 0
@@ -1589,7 +1679,7 @@ def run_news_cycle(
         try:
             retry_operation(
                 "Teams 전송",
-                lambda: send_to_teams(webhook_url, sections, timeout),
+                lambda: send_to_teams(webhook_url, sections, timeout, stats),
             )
             print(f"[Teams] 사건 {total}건을 본문 하나로 전송 완료")
         except RuntimeError as exc:
