@@ -1490,6 +1490,7 @@ def build_teams_message(
     revisited: tuple[Story, ...] = (),
     revisited_hidden: int = 0,
     feedback_enabled: bool = False,
+    omitted_count: int = 0,
 ) -> dict[str, str]:
     """큐레이션한 구획 전체를 Teams 일반 메시지용 HTML 본문 하나로 만든다."""
     collected_at = datetime.now(KST).strftime("%Y-%m-%d %H:%M KST")
@@ -1507,6 +1508,11 @@ def build_teams_message(
     if stats is not None:
         notice = "<br>".join(html.escape(line) for line in notice_lines(stats))
         lines.append(f"<blockquote><small>{notice}</small></blockquote>")
+    if omitted_count:
+        lines.append(
+            f"<p><small>Teams 본문 크기 제한으로 후순위 사건 {omitted_count}건은 "
+            "생략했습니다. 전체 내용은 HTML 보고서에서 확인하세요.</small></p>"
+        )
     if not total:
         lines.append("<p>보고할 새 뉴스가 없습니다.</p>")
         lines.extend(revisited_teams_block(revisited, revisited_hidden))
@@ -1560,22 +1566,34 @@ def send_to_teams(
     report_url: str | None = None,
 ) -> None:
     """큐레이션한 뉴스가 담긴 일반 메시지 하나를 Teams로 전송한다."""
-    data = json.dumps(
-        build_teams_message(
-            report.sections,
-            report.stats,
-            report_url,
-            report.revisited,
-            report.revisited_hidden,
-            bool(get_feedback_api_url()),
-        ),
-        ensure_ascii=False,
-    ).encode("utf-8")
-    if len(data) > TEAMS_MAX_PAYLOAD_BYTES:
-        raise RuntimeError(
-            f"Teams 메시지가 너무 큽니다({len(data):,}바이트). "
-            "-n 옵션으로 주제별 기사 수를 줄여 주세요."
+    sections = {title: list(stories) for title, stories in report.sections.items()}
+    original_total = sum(len(stories) for stories in sections.values())
+    while True:
+        remaining = sum(len(stories) for stories in sections.values())
+        data = json.dumps(
+            build_teams_message(
+                sections,
+                report.stats,
+                report_url,
+                report.revisited,
+                report.revisited_hidden,
+                bool(get_feedback_api_url()),
+                original_total - remaining,
+            ),
+            ensure_ascii=False,
+        ).encode("utf-8")
+        if len(data) <= TEAMS_MAX_PAYLOAD_BYTES:
+            break
+        removable = next(
+            (stories for stories in reversed(list(sections.values())) if stories),
+            None,
         )
+        if removable is None:
+            raise RuntimeError(f"Teams 메시지가 너무 큽니다({len(data):,}바이트).")
+        removable.pop()
+    omitted = original_total - remaining
+    if omitted:
+        print(f"[Teams] 본문 제한에 맞춰 후순위 사건 {omitted}건을 생략합니다.")
     request = Request(
         webhook_url,
         data=data,
