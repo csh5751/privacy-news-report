@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import html
 import json
 import math
@@ -21,7 +22,7 @@ from io import TextIOBase
 from pathlib import Path
 from typing import Callable, Iterable, TypeVar
 from urllib.error import HTTPError, URLError
-from urllib.parse import parse_qs, urlencode, urlparse
+from urllib.parse import parse_qs, urlencode, urlparse, urlsplit, urlunsplit
 from urllib.request import Request, urlopen
 from xml.etree import ElementTree
 
@@ -128,6 +129,7 @@ class Story:
     importance: int
     representative: Article
     related: tuple[Article, ...] = ()
+    feedback_score: int = 0
 
     @property
     def articles(self) -> tuple[Article, ...]:
@@ -683,6 +685,23 @@ def article_keys(article: Article) -> set[str]:
     return keys
 
 
+def article_id(article: Article) -> str:
+    """피드백 저장과 링크에 쓸 안정적인 익명 기사 ID를 만든다."""
+    keys = article_keys(article)
+    basis = next((key for key in keys if key.startswith("url:")), min(keys))
+    return hashlib.sha256(basis.encode("utf-8")).hexdigest()[:24]
+
+
+def feedback_link(report_url: str, story: Story, vote: str) -> str:
+    """Teams에서 보고서의 안전한 투표 확인 화면으로 이동하는 링크를 만든다."""
+    identifier = article_id(story.representative)
+    parts = urlsplit(report_url)
+    query = parse_qs(parts.query, keep_blank_values=True)
+    query["feedback"] = [identifier]
+    query["vote"] = [vote]
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query, doseq=True), f"article-{identifier}"))
+
+
 def story_tokens(value: str) -> set[str]:
     """기사 비교에 쓸 핵심 단어를 추출한다."""
     return {
@@ -1136,13 +1155,46 @@ def story_heat(story: Story) -> tuple[int, float]:
     단독 보도를 버리지는 않되, 같은 급이면 원문이 있는 사건에 자리를 준다.
     """
     coverage = min(len(story.articles), HEAT_COVERAGE_CAP)
-    score = story.importance * 10 + coverage
+    score = story.importance * 10 + coverage + story.feedback_score
     if is_aggregator(story.representative):
         score -= HEAT_RELAY_PENALTY
     published = story.representative.published or datetime.min.replace(
         tzinfo=timezone.utc
     )
     return score, published.timestamp()
+
+
+def apply_feedback(stories: list[Story], signals: list[dict[str, object]], keywords: list[str]) -> list[Story]:
+    """누적 평가를 점수에 반영하고 반복적으로 싫어한 유형은 제외한다."""
+    adjusted: list[Story] = []
+    for story in stories:
+        current_id = article_id(story.representative)
+        section = story_section(story, keywords)
+        tokens = story_tokens(f"{story.headline} {story.summary}")
+        score = exact_down = similar_down = weak_source_down = 0
+        for signal in signals:
+            count = max(0, int(signal.get("count", 0) or 0))
+            vote = str(signal.get("vote", ""))
+            reason = str(signal.get("reason", ""))
+            sign = 1 if vote == "up" else -1
+            if str(signal.get("article_id", "")) == current_id:
+                score += sign * count * (18 if sign > 0 else 25)
+                exact_down += count if sign < 0 else 0
+            if str(signal.get("topic", "")) == section:
+                score += sign * min(count * 2, 8)
+            old_tokens = story_tokens(str(signal.get("title", "")))
+            overlap = len(tokens & old_tokens) / max(1, min(len(tokens), len(old_tokens)))
+            if overlap >= 0.55:
+                score += sign * min(count * 5, 15)
+                if sign < 0 and reason not in {"duplicate", "low_credibility"}:
+                    similar_down += count
+            if sign < 0 and reason == "low_credibility" and str(signal.get("source", "")).casefold() == story.representative.source.casefold():
+                weak_source_down += count
+                score -= min(count * 8, 24)
+        if exact_down or similar_down >= 2 or weak_source_down >= 2:
+            continue
+        adjusted.append(replace(story, feedback_score=max(-30, min(30, score))))
+    return adjusted
 
 
 def coverage_importance(outlets: int) -> int:
@@ -1437,6 +1489,7 @@ def build_teams_message(
     report_url: str | None = None,
     revisited: tuple[Story, ...] = (),
     revisited_hidden: int = 0,
+    feedback_enabled: bool = False,
 ) -> dict[str, str]:
     """큐레이션한 구획 전체를 Teams 일반 메시지용 HTML 본문 하나로 만든다."""
     collected_at = datetime.now(KST).strftime("%Y-%m-%d %H:%M KST")
@@ -1483,6 +1536,10 @@ def build_teams_message(
                 f"<small>{source} · {published} · 중요도 {story.importance}</small><br>",
                 summary,
             ]
+            if report_url and feedback_enabled:
+                up = html.escape(feedback_link(report_url, story, "up"), quote=True)
+                down = html.escape(feedback_link(report_url, story, "down"), quote=True)
+                entry.append(f'<br><small>평가: <a href="{up}">👍 도움돼요</a> &nbsp; <a href="{down}">👎 별로예요</a></small>')
             if story.related:
                 names = html.escape(
                     ", ".join(item.source for item in story.related[:4])
@@ -1510,6 +1567,7 @@ def send_to_teams(
             report_url,
             report.revisited,
             report.revisited_hidden,
+            bool(get_feedback_api_url()),
         ),
         ensure_ascii=False,
     ).encode("utf-8")
@@ -1602,6 +1660,26 @@ def get_anthropic_api_key() -> str | None:
 def get_report_url() -> str:
     """HTML 보고서가 올라가는 주소를 반환한다."""
     return get_user_setting("REPORT_URL") or DEFAULT_REPORT_URL
+
+
+def get_feedback_api_url() -> str | None:
+    value = get_user_setting("FEEDBACK_API_URL")
+    return value.rstrip("/") if value else None
+
+
+def load_feedback_signals(api_url: str | None, timeout: float) -> list[dict[str, object]]:
+    """피드백 API가 없거나 잠시 실패해도 뉴스 발행은 계속한다."""
+    if not api_url:
+        return []
+    request = Request(f"{api_url}/signals", headers={"User-Agent": USER_AGENT})
+    try:
+        with urlopen(request, timeout=timeout) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        signals = payload.get("signals", []) if isinstance(payload, dict) else []
+        return [item for item in signals if isinstance(item, dict)]
+    except (OSError, ValueError, HTTPError, URLError) as exc:
+        print(f"[피드백] 누적 평가를 불러오지 못해 이번 실행에서는 생략합니다: {exc}", file=sys.stderr)
+        return []
 
 
 def get_anthropic_workspace_id() -> str | None:
@@ -1784,6 +1862,7 @@ def build_report(
     window_hours: int,
     api_key: str | None,
     excluded_keys: set[str] | None = None,
+    feedback_api_url: str | None = None,
 ) -> Report:
     """후보를 모아 큐레이션한 구획과 처리 내역을 만든다."""
     pool, failures = collect_candidates(keywords, timeout, window_hours)
@@ -1795,7 +1874,16 @@ def build_report(
     )
 
     relevant = filter_relevant(candidates)
-    stories, curator = curate(relevant, limit, api_key)
+    # 피드백이 켜져 있으면 여유 후보까지 평가해야 선호 기사를 실제 상위권으로 올리고
+    # 제외된 기사 자리도 다른 새 기사로 채울 수 있다.
+    curation_limit = limit + 20 if feedback_api_url else limit
+    stories, curator = curate(relevant, curation_limit, api_key)
+    signals = load_feedback_signals(feedback_api_url, timeout)
+    stories = apply_feedback(stories, signals, keywords)
+    stories.sort(key=story_heat, reverse=True)
+    stories = stories[:limit]
+    if signals:
+        print(f"[피드백] 누적 평가 신호 {len(signals)}개를 선별 순위에 반영했습니다.")
     sections = group_sections(stories, keywords)
     filled = sum(1 for entries in sections.values() if entries)
     reported = [story for entries in sections.values() for story in entries]
@@ -1846,6 +1934,7 @@ def write_site(report: Report, output: str) -> None:
             report.stats,
             report.revisited,
             report.revisited_hidden,
+            get_feedback_api_url(),
         ),
         encoding="utf-8",
     )
@@ -1866,7 +1955,7 @@ def run_news_cycle(
     print(f"{', '.join(keywords)} 주제의 새 뉴스를 가져오는 중입니다...")
     history = load_sent_history()
     report = build_report(
-        keywords, limit, timeout, window_hours, api_key, set(history)
+        keywords, limit, timeout, window_hours, api_key, set(history), get_feedback_api_url()
     )
     sections, stats = report.sections, report.stats
     failures = stats.failed_keywords

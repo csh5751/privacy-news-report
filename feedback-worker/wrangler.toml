@@ -1,0 +1,11 @@
+name = "privacy-news-feedback"
+main = "src/index.js"
+compatibility_date = "2026-09-14"
+
+[vars]
+ALLOWED_ORIGIN = "https://csh5751.github.io"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "privacy-news-feedback"
+database_id = "7f2f691c-db7a-4f6c-921b-840aebe64b44"

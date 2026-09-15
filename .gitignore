@@ -4,3 +4,7 @@ __pycache__/
 
 # 실행마다 생성되는 산출물. Pages는 이 파일을 artifact로 올리므로 추적하지 않는다.
 site/
+
+# Node/Cloudflare local files
+feedback-worker/node_modules/
+feedback-worker/.wrangler/

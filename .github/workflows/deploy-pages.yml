@@ -29,6 +29,7 @@ jobs:
     env:
       # 실행 사이에 이어갈 전송 이력. 이 파일이 있어야 같은 기사를 두 번 보내지 않는다.
       NEWS_HISTORY_FILE: data/sent_articles.json
+      FEEDBACK_API_URL: ${{ vars.FEEDBACK_API_URL }}
 
     steps:
       - name: Checkout

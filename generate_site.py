@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import html
+import json
 import os
 import sys
 from datetime import datetime, timedelta, timezone
@@ -16,7 +17,7 @@ KST = timezone(timedelta(hours=9))
 DEFAULT_STORY_LIMIT = 30
 
 
-def story_html(story: app.Story) -> str:
+def story_html(story: app.Story, feedback_enabled: bool = False) -> str:
     article = story.representative
     headline = html.escape(story.headline)
     link = html.escape(article.link, quote=True)
@@ -27,19 +28,28 @@ def story_html(story: app.Story) -> str:
     if story.related:
         names = html.escape(", ".join(item.source for item in story.related[:5]))
         related = f'<p class="related">관련 보도 {len(story.related)}건 · {names}</p>'
+    identifier = app.article_id(article)
+    feedback = ""
+    if feedback_enabled:
+        feedback = '''
+        <div class="feedback" aria-label="기사 평가">
+          <button type="button" data-vote="up">👍 <span>도움돼요</span></button>
+          <button type="button" data-vote="down">👎 <span>별로예요</span></button>
+          <small class="feedback-status" aria-live="polite"></small>
+        </div>'''
     return f"""
-      <article class="article">
+      <article class="article" id="article-{identifier}" data-article-id="{identifier}" data-title="{html.escape(story.headline, quote=True)}" data-source="{source}" data-topic="{html.escape(story.section, quote=True)}" data-url="{link}">
         <h3><a href="{link}" target="_blank" rel="noopener noreferrer">{headline}</a></h3>
         <p class="meta">{source}<span aria-hidden="true"> · </span>{published}<span aria-hidden="true"> · </span>중요도 {story.importance}</p>
         <p class="summary">{summary}</p>{related}
-        <a class="article-link" href="{link}" target="_blank" rel="noopener noreferrer">원문 보기 <span aria-hidden="true">→</span></a>
+        <a class="article-link" href="{link}" target="_blank" rel="noopener noreferrer">원문 보기 <span aria-hidden="true">→</span></a>{feedback}
       </article>"""
 
 
-def section_html(title: str, stories: list[app.Story]) -> str:
+def section_html(title: str, stories: list[app.Story], feedback_enabled: bool = False) -> str:
     title_text = html.escape(title)
     if stories:
-        contents = "".join(story_html(story) for story in stories)
+        contents = "".join(story_html(story, feedback_enabled) for story in stories)
     else:
         contents = '<p class="empty">검색된 뉴스가 없습니다.</p>'
     return f"""
@@ -93,19 +103,58 @@ def revisited_html(revisited: tuple[app.Story, ...], hidden: int) -> str:
     </details>"""
 
 
+def feedback_javascript(api_url: str) -> str:
+    endpoint = json.dumps(api_url.rstrip("/"), ensure_ascii=False)
+    return f'''<script>
+(() => {{
+  const api = {endpoint};
+  let voter = localStorage.getItem("privacy-news-voter");
+  if (!voter) {{ voter = crypto.randomUUID(); localStorage.setItem("privacy-news-voter", voter); }}
+  const dialog = document.getElementById("feedback-dialog");
+  let pendingArticle = null;
+  async function send(article, vote, reason = "") {{
+    const status = article.querySelector(".feedback-status");
+    status.textContent = "저장 중…";
+    try {{
+      const response = await fetch(api + "/feedback", {{method:"POST", headers:{{"Content-Type":"application/json"}}, body:JSON.stringify({{
+        article_id: article.dataset.articleId, voter_id: voter, vote, reason,
+        title: article.dataset.title, source: article.dataset.source,
+        topic: article.dataset.topic, url: article.dataset.url
+      }})}});
+      if (!response.ok) throw new Error("HTTP " + response.status);
+      article.querySelectorAll("[data-vote]").forEach(button => button.classList.toggle("selected", button.dataset.vote === vote));
+      status.textContent = "의견이 저장됐습니다.";
+      history.replaceState(null, "", location.pathname + location.hash);
+    }} catch (error) {{ status.textContent = "저장하지 못했습니다. 잠시 후 다시 시도해 주세요."; }}
+  }}
+  function choose(article, vote, confirmFirst = false) {{
+    article.scrollIntoView({{behavior:"smooth", block:"center"}});
+    if (confirmFirst && !confirm(vote === "up" ? "이 기사가 도움이 됐다고 저장할까요?" : "이 기사가 별로였다고 평가할까요?")) return;
+    if (vote === "down") {{ pendingArticle = article; dialog.showModal(); }} else send(article, vote);
+  }}
+  document.querySelectorAll(".article [data-vote]").forEach(button => button.addEventListener("click", () => choose(button.closest(".article"), button.dataset.vote)));
+  dialog.addEventListener("close", () => {{ if (dialog.returnValue && dialog.returnValue !== "cancel" && pendingArticle) send(pendingArticle, "down", dialog.returnValue); pendingArticle = null; }});
+  const params = new URLSearchParams(location.search), id = params.get("feedback"), vote = params.get("vote");
+  if (id && ["up","down"].includes(vote)) {{ const article = document.getElementById("article-" + id); if (article) setTimeout(() => choose(article, vote, true), 250); }}
+}})();
+</script>'''
+
+
 def build_page(
     topics: dict[str, list[app.Story]],
     generated_at: datetime,
     stats: app.RunStats | None = None,
     revisited: tuple[app.Story, ...] = (),
     revisited_hidden: int = 0,
+    feedback_api_url: str | None = None,
 ) -> str:
     total = sum(len(stories) for stories in topics.values())
     sections = "".join(
-        section_html(title, stories) for title, stories in topics.items()
+        section_html(title, stories, bool(feedback_api_url)) for title, stories in topics.items()
     ) + revisited_html(revisited, revisited_hidden)
     notice = notice_html(stats)
     updated = html.escape(generated_at.astimezone(KST).strftime("%Y년 %m월 %d일 %H:%M KST"))
+    feedback_script = feedback_javascript(feedback_api_url) if feedback_api_url else ""
     return f"""<!doctype html>
 <html lang="ko">
 <head>
@@ -154,6 +203,13 @@ def build_page(
     .summary {{ margin: 0 0 13px; color: var(--text); font-size: .92rem; }}
     .related {{ margin: 0 0 13px; color: var(--muted); font-size: .8rem; }}
     .article-link {{ color: var(--accent); font-size: .85rem; font-weight: 600; text-decoration: none; }}
+    .feedback {{ display: flex; align-items: center; gap: 8px; margin-top: 14px; flex-wrap: wrap; }}
+    .feedback button {{ border: 1px solid var(--line); border-radius: 999px; padding: 6px 10px; background: var(--surface); color: var(--text); cursor: pointer; }}
+    .feedback button:hover, .feedback button.selected {{ border-color: var(--accent); background: var(--accent-soft); }}
+    .feedback-status {{ color: var(--muted); }}
+    dialog {{ max-width: 420px; border: 1px solid var(--line); border-radius: 14px; padding: 22px; background: var(--surface); color: var(--text); }}
+    dialog::backdrop {{ background: rgba(0,0,0,.45); }}
+    .reason-list {{ display: grid; gap: 8px; margin: 16px 0; }}
     .empty {{ padding: 24px; color: var(--muted); }}
     .seen {{ background: transparent; box-shadow: none; border-style: dashed; }}
     .seen > summary {{ color: var(--muted); font-size: .98rem; font-weight: 600; }}
@@ -196,6 +252,8 @@ def build_page(
   <main class="wrap">{sections}
   </main>
   <footer class="wrap">공개 뉴스 검색 결과를 자동으로 수집한 요약입니다. 정확한 내용은 원문을 확인하세요.</footer>
+  <dialog id="feedback-dialog"><form method="dialog"><strong>별로인 이유를 알려주세요</strong><div class="reason-list"><button value="irrelevant">주제와 관련 없음</button><button value="duplicate">이미 본 내용·중복</button><button value="promotional">홍보성 기사</button><button value="low_credibility">신뢰도가 낮은 매체</button><button value="not_interested">관심 없는 유형</button></div><button value="cancel">취소</button></form></dialog>
+  {feedback_script}
 </body>
 </html>
 """
@@ -244,7 +302,8 @@ def main(argv: list[str] | None = None) -> int:
 
     # 보고서는 전체 현황을 보여주는 페이지라 전송 이력으로 걸러내지 않는다.
     report = app.build_report(
-        keywords, args.limit, args.timeout, args.window_hours, api_key
+        keywords, args.limit, args.timeout, args.window_hours, api_key,
+        feedback_api_url=app.get_feedback_api_url(),
     )
     sections, stats = report.sections, report.stats
     for line in app.notice_lines(stats):
@@ -268,6 +327,7 @@ def main(argv: list[str] | None = None) -> int:
             stats,
             report.revisited,
             report.revisited_hidden,
+            app.get_feedback_api_url(),
         ),
         encoding="utf-8",
     )
