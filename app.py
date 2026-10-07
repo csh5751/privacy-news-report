@@ -58,23 +58,26 @@ STORY_STOPWORDS = {
 }
 # 같은 사건으로 볼 제목 유사도. IDF 가중 기준이라 흔한 단어만 겹쳐도 묶이지 않는다.
 STORY_MATCH_RATIO = 0.45
-# 개인정보·보안 사건임을 알려주는 표현. 하나 걸릴 때마다 점수를 올린다.
-RELEVANCE_SIGNALS = (
+# 개인정보·보안 "사건"임을 분명히 알려주는 표현. 하나만 걸려도 사건 기사로 본다.
+RELEVANCE_STRONG_SIGNALS = (
     "유출", "해킹", "침해", "과징금", "제재", "처분", "시정명령", "시정조치",
     "조사", "의결", "고시", "시행령", "개정", "입법", "취약점", "랜섬웨어",
     "피싱", "스미싱", "악성코드", "디도스", "위반", "집단소송", "손해배상",
-    "보상안", "사과", "개인정보", "프라이버시", "정보보호", "가명정보",
+    "보상안", "사과", "개인정보", "프라이버시", "가명정보",
     "마이데이터", "cpo", "gdpr", "개보위", "감독", "보안사고", "정보통신망법",
-    # 보안 자체가 주제인 기사도 남긴다. 홍보성 기사는 아래 노이즈 점수로 걸러진다.
-    "보안", "사이버", "암호화", "인증", "사찰", "감시",
 )
-# 홍보·시장 뉴스 표현. 신호가 없으면 이쪽이 걸린 기사는 걸러낸다.
+# 보안·개인정보가 주제이긴 하지만 그 자체로는 사건인지 알 수 없는 표현.
+# 홍보·시황성 기사에도 흔히 섞여 들어가므로 노이즈와 맞서는 약한 신호로만 둔다.
+RELEVANCE_WEAK_SIGNALS = ("보안", "사이버", "암호화", "인증", "사찰", "감시", "정보보호")
+# 홍보·시장·행사 뉴스 표현. 하나만 걸려도 사건 기사일 가능성을 크게 낮춘다.
 RELEVANCE_NOISE = (
     "출시", "선보", "실적", "매출", "영업이익", "주가", "수주", "협약", "mou",
     "수상", "임명", "채용", "세미나", "컨퍼런스", "웨비나", "공모전", "이벤트",
     "할인", "프로모션", "솔루션", "간담회", "포럼", "박람회", "출범", "체결",
+    "수혜", "증설", "목표가", "매수", "투자의견", "리서치", "애널리스트",
+    "강세", "급등", "급락", "편입", "조직위", "부스", "참가신청",
 )
-RELEVANCE_MIN_SCORE = 1
+RELEVANCE_MIN_SCORE = 3
 # 필터가 후보를 이만큼 아래로 깎으면 신호어 목록이 현실을 못 따라간 것으로 보고 되돌린다.
 RELEVANCE_MIN_KEPT_RATIO = 0.15
 # Bing 피드는 관련도 순으로 12건 남짓만 돌려주므로 Google 피드로 최신 기사를 보충한다.
@@ -749,11 +752,17 @@ def is_user_generated(article: Article) -> bool:
 
 
 def relevance_score(article: Article) -> int:
-    """개인정보·보안 사건일 가능성을 점수로 매긴다. 높을수록 관련도가 높다."""
+    """개인정보·보안 사건일 가능성을 점수로 매긴다. 높을수록 관련도가 높다.
+
+    "보안"·"사이버" 같은 약한 신호만으로는 통과시키지 않는다. 증권 리서치나
+    행사 홍보 기사에도 흔히 섞여 들어가 노이즈 하나에도 뒤집히기 때문이다.
+    사건임을 분명히 하는 강한 신호는 노이즈보다 우선한다.
+    """
     text = f"{article.title} {article.description}".casefold()
-    signals = sum(1 for term in RELEVANCE_SIGNALS if term in text)
+    strong = sum(1 for term in RELEVANCE_STRONG_SIGNALS if term in text)
+    weak = sum(1 for term in RELEVANCE_WEAK_SIGNALS if term in text)
     noise = sum(1 for term in RELEVANCE_NOISE if term in text)
-    return signals * 2 - noise
+    return strong * 3 + weak - noise * 3
 
 
 def filter_relevant(articles: list[Article]) -> list[Article]:
@@ -978,7 +987,9 @@ CURATION_SYSTEM_PROMPT = """\
 
 사건 묶기:
 - 여러 언론사가 같은 사건을 보도한 경우 하나의 story로 묶고 나머지는 related에 넣습니다.
-- 같은 기관·기업이 등장해도 사건이 다르면(예: 소명 절차와 과징금 처분) 별도 story로 둡니다.
+- 제목과 표현이 서로 달라도 같은 통계·보고서·발표를 다루면(예: 같은 국회 자료, 같은
+  조사 결과를 다른 수치·문장으로 전달) 같은 사건으로 보고 하나의 story로 묶습니다.
+- 같은 기관·기업이 등장해도 사건 자체가 다르면(예: 소명 절차와 과징금 처분) 별도 story로 둡니다.
 - 대표 기사는 원 언론사 기사를 고릅니다. 네이트, 다음, MSN처럼 남의 기사를 실어주는
   매체나 제목만 있는 기사는 피하고, 내용이 구체적인 기사를 대표로 삼습니다.
 
@@ -1263,6 +1274,46 @@ def curate(
             file=sys.stderr,
         )
         return curate_heuristically(articles, limit), HEURISTIC_CURATOR
+
+
+def merge_duplicate_stories(stories: list[Story]) -> list[Story]:
+    """큐레이션이 놓친 같은 사건을 한 번 더 합친다.
+
+    휴리스틱이든 Claude 큐레이션이든 제목 표현이 크게 다른 같은 사건은 별개
+    Story로 남을 수 있고, 그러면 구획을 나눌 때 같은 사건이 서로 다른
+    구획에 중복으로 실린다. same_story로 한 번 더 걸러 합친다.
+    """
+    weights = token_weights(article for story in stories for article in story.articles)
+    merged: list[Story] = []
+    for story in stories:
+        match = next(
+            (
+                existing
+                for existing in merged
+                if any(
+                    same_story(left, right, weights)
+                    for left in story.articles
+                    for right in existing.articles
+                )
+            ),
+            None,
+        )
+        if match is None:
+            merged.append(story)
+            continue
+        combined = tuple(dict.fromkeys(match.articles + story.articles))
+        representative = max(combined, key=representative_score)
+        related = tuple(item for item in combined if item is not representative)
+        index = merged.index(match)
+        merged[index] = prefer_original_outlet(
+            replace(
+                match,
+                representative=representative,
+                related=related,
+                importance=max(match.importance, story.importance),
+            )
+        )
+    return merged
 
 
 OTHER_SECTION = "기타"
@@ -1896,6 +1947,7 @@ def build_report(
     # 제외된 기사 자리도 다른 새 기사로 채울 수 있다.
     curation_limit = limit + 20 if feedback_api_url else limit
     stories, curator = curate(relevant, curation_limit, api_key)
+    stories = merge_duplicate_stories(stories)
     signals = load_feedback_signals(feedback_api_url, timeout)
     stories = apply_feedback(stories, signals, keywords)
     stories.sort(key=story_heat, reverse=True)
