@@ -40,6 +40,8 @@ DEFAULT_KEYWORDS = [
     "개인정보 유출 사고",
     "개인정보보호법",
     "AI 보안",
+    "사이버보안 침해사고",
+    "다크웹 개인정보 거래",
 ]
 TAG_RE = re.compile(r"<[^>]+>")
 SPACE_RE = re.compile(r"\s+")
