@@ -32,10 +32,12 @@ GOOGLE_NEWS_URL = "https://news.google.com/rss/search"
 KAKAO_TOKEN_URL = "https://kauth.kakao.com/oauth/token"
 KAKAO_MEMO_URL = "https://kapi.kakao.com/v2/api/talk/memo/default/send"
 USER_AGENT = "Mozilla/5.0 (compatible; KeywordNewsReader/1.0)"
+# "개보위"는 "개인정보보호위원회"의 약칭이라 같은 사건 기사에 거의 항상 둘 다
+# 걸린다. 구획을 나눌 때 득표가 더 많은 정식 명칭 쪽이 거의 매번 이겨서
+# "개보위" 구획은 실제 기사가 있어도 항상 비므로 별도 키워드로 두지 않는다.
 DEFAULT_KEYWORDS = [
     "개인정보보호위원회",
     "개인정보 유출 사고",
-    "개보위",
     "개인정보보호법",
     "AI 보안",
 ]
@@ -1363,6 +1365,36 @@ def group_sections(
     )
 
 
+def select_balanced_stories(
+    sections: dict[str, list[Story]], limit: int
+) -> dict[str, list[Story]]:
+    """전체 한도 안에서 구획마다 최소 한 자리를 보장하며 사건을 고른다.
+
+    화제성 순으로 전체를 한 번에 자르면 보도량이 큰 구획(유출 사고, AI 보안)이
+    자리를 거의 다 가져가, 후보가 분명히 있는 구획도 0건으로 보일 수 있다.
+    후보가 있는 구획에는 먼저 한 자리씩 주고, 남는 자리만 화제성 순으로 채운다.
+    """
+    remaining = {key: list(entries) for key, entries in sections.items()}
+    selected: dict[str, list[Story]] = {key: [] for key in sections}
+    count = 0
+    for key, entries in remaining.items():
+        if count >= limit:
+            break
+        if entries:
+            selected[key].append(entries.pop(0))
+            count += 1
+    pool = [(key, story) for key, entries in remaining.items() for story in entries]
+    pool.sort(key=lambda item: story_heat(item[1]), reverse=True)
+    for key, story in pool:
+        if count >= limit:
+            break
+        selected[key].append(story)
+        count += 1
+    for entries in selected.values():
+        entries.sort(key=story_heat, reverse=True)
+    return selected
+
+
 def history_path() -> Path:
     """전송 이력 파일 경로를 반환한다.
 
@@ -1943,18 +1975,19 @@ def build_report(
     )
 
     relevant = filter_relevant(candidates)
-    # 피드백이 켜져 있으면 여유 후보까지 평가해야 선호 기사를 실제 상위권으로 올리고
-    # 제외된 기사 자리도 다른 새 기사로 채울 수 있다.
-    curation_limit = limit + 20 if feedback_api_url else limit
+    # 화제성으로 전체를 한 번에 자르면 보도량이 큰 키워드가 자리를 다 차지해
+    # 후보가 있는 다른 구획도 0건으로 보일 수 있다. 구획별로 최소 한 자리씩
+    # 보장하려면 자르기 전에 후보를 넉넉히 남겨둬야 한다. 피드백이 켜져 있으면
+    # 선호 기사를 상위권에 올리는 데도 여유 후보가 필요해 폭을 더 늘린다.
+    curation_limit = limit + (20 if feedback_api_url else len(keywords) * 4)
     stories, curator = curate(relevant, curation_limit, api_key)
     stories = merge_duplicate_stories(stories)
     signals = load_feedback_signals(feedback_api_url, timeout)
     stories = apply_feedback(stories, signals, keywords)
-    stories.sort(key=story_heat, reverse=True)
-    stories = stories[:limit]
+    sections = group_sections(stories, keywords)
+    sections = select_balanced_stories(sections, limit)
     if signals:
         print(f"[피드백] 누적 평가 신호 {len(signals)}개를 선별 순위에 반영했습니다.")
-    sections = group_sections(stories, keywords)
     filled = sum(1 for entries in sections.values() if entries)
     reported = [story for entries in sections.values() for story in entries]
 
