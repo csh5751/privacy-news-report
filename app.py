@@ -351,6 +351,10 @@ def fetch_with_curl(url: str, timeout: float) -> bytes:
     except subprocess.CalledProcessError as exc:
         message = exc.stderr.decode("utf-8", errors="replace").strip()
         raise RuntimeError(f"뉴스 서버에 연결할 수 없습니다: {message}") from exc
+    except OSError as exc:
+        # 권한 정책 등으로 curl 프로세스 자체를 못 띄우는 경우. 잡아두지 않으면
+        # RuntimeError만 처리하는 재시도·소스별 폴백을 건너뛰고 전체 실행이 죽는다.
+        raise RuntimeError(f"curl을 실행할 수 없습니다: {exc}") from exc
 
 
 def post_with_curl(url: str, data: bytes, timeout: float) -> None:
@@ -388,6 +392,8 @@ def post_with_curl(url: str, data: bytes, timeout: float) -> None:
     except subprocess.CalledProcessError as exc:
         message = exc.stderr.decode("utf-8", errors="replace").strip()
         raise RuntimeError(f"Teams 전송에 실패했습니다: {message}") from exc
+    except OSError as exc:
+        raise RuntimeError(f"curl을 실행할 수 없습니다: {exc}") from exc
 
 
 def post_kakao_form(
