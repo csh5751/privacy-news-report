@@ -90,6 +90,9 @@ DEFAULT_WINDOW_HOURS = 30
 # 이 모델은 adaptive thinking과 effort를 지원하지 않으므로(4.6 이후 기능) 보내지 않는다.
 CURATION_MODEL = "claude-haiku-4-5"
 CURATION_MAX_CANDIDATES = 400
+# build_report가 섹션별로 최소 한 자리씩 보장하려고 요청 폭을 넓혀도(큰 limit),
+# 모델 호출 비용까지 그만큼 늘어나면 안 되므로 모델에 요청하는 사건 수는 따로 막는다.
+CURATION_MAX_STORIES = 40
 CURATION_DESCRIPTION_LIMIT = 200
 CURATION_MAX_TOKENS = 16_000
 # 뉴스 요청 제한 시간과 별개다. 수백 건을 판단하는 호출은 수 분이 걸릴 수 있다.
@@ -1097,6 +1100,7 @@ def curate_with_claude(
             "anthropic 패키지가 없습니다. pip install anthropic으로 설치하세요."
         ) from exc
 
+    limit = min(limit, CURATION_MAX_STORIES)
     candidates = articles[:CURATION_MAX_CANDIDATES]
     if len(articles) > CURATION_MAX_CANDIDATES:
         print(
@@ -1983,11 +1987,13 @@ def build_report(
     )
 
     relevant = filter_relevant(candidates)
-    # 화제성으로 전체를 한 번에 자르면 보도량이 큰 키워드가 자리를 다 차지해
-    # 후보가 있는 다른 구획도 0건으로 보일 수 있다. 구획별로 최소 한 자리씩
-    # 보장하려면 자르기 전에 후보를 넉넉히 남겨둬야 한다. 피드백이 켜져 있으면
-    # 선호 기사를 상위권에 올리는 데도 여유 후보가 필요해 폭을 더 늘린다.
-    curation_limit = limit + (20 if feedback_api_url else len(keywords) * 4)
+    # 화제성으로 후보를 한 번에 자르면 보도량이 큰 키워드가 자리를 다 차지해
+    # 후보가 분명히 있는 다른 구획도 0건으로 보일 수 있다(단독 보도만 있는
+    # 사건은 화제성 점수가 낮아 가장 먼저 잘려나간다). 구획별로 최소 한 자리씩
+    # 보장하려면 사건 묶기 단계에서는 자르지 않고 가능한 사건을 전부 남겨야
+    # 한다. 실제 개수 제한은 섹션을 나눈 뒤 select_balanced_stories에서만 건다.
+    # Claude에 보내는 사건 수는 curate_with_claude가 비용 때문에 별도로 막는다.
+    curation_limit = len(relevant)
     stories, curator = curate(relevant, curation_limit, api_key)
     stories = merge_duplicate_stories(stories)
     signals = load_feedback_signals(feedback_api_url, timeout)
