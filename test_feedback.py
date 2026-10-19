@@ -33,12 +33,12 @@ class FeedbackTests(unittest.TestCase):
     def test_exact_downvote_excludes_article(self):
         story = self.story()
         signals = [{"article_id": app.article_id(story.representative), "vote": "down", "reason": "irrelevant", "count": 1, "title": story.headline, "topic": story.section, "source": "신뢰신문"}]
-        self.assertEqual(app.apply_feedback([story], signals, [story.section]), [])
+        self.assertEqual(app.apply_feedback([story], signals), [])
 
     def test_upvote_boosts_story_score(self):
         story = self.story()
         signals = [{"article_id": app.article_id(story.representative), "vote": "up", "reason": "", "count": 1, "title": story.headline, "topic": story.section, "source": "신뢰신문"}]
-        result = app.apply_feedback([story], signals, [story.section])
+        result = app.apply_feedback([story], signals)
         self.assertGreater(result[0].feedback_score, 0)
 
 

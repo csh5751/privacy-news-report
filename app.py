@@ -140,6 +140,9 @@ class Story:
     representative: Article
     related: tuple[Article, ...] = ()
     feedback_score: int = 0
+    # 큐레이션(Claude)이 직접 판단해 돌려준 구획. 비어 있으면 classify_sections로
+    # 본문을 보고 휴리스틱하게 판단한다.
+    preset_sections: tuple[str, ...] = ()
 
     @property
     def articles(self) -> tuple[Article, ...]:
@@ -963,6 +966,20 @@ CURATION_SCHEMA = {
                         "description": "실무 중요도. 5가 가장 높다.",
                         "enum": [1, 2, 3, 4, 5],
                     },
+                    "sections": {
+                        "type": "array",
+                        "description": (
+                            "이 사건이 속할 구획. 개인정보보호법상 유출 신고 대상이면"
+                            " '개인정보 유출 사고', 정보통신망법상 침해사고 신고 대상이면"
+                            " '사이버보안 침해사고', 둘 다 해당하면 둘 다 넣는다."
+                            " 둘 다 아니면 '동향' 하나만 넣는다."
+                        ),
+                        "items": {
+                            "type": "string",
+                            "enum": ["개인정보 유출 사고", "사이버보안 침해사고", "동향"],
+                        },
+                        "minItems": 1,
+                    },
                     "representative": {
                         "type": "integer",
                         "description": "대표로 삼을 후보 기사 번호",
@@ -977,6 +994,7 @@ CURATION_SCHEMA = {
                     "headline",
                     "summary",
                     "importance",
+                    "sections",
                     "representative",
                     "related",
                 ],
@@ -1010,6 +1028,22 @@ CURATION_SYSTEM_PROMPT = """\
 - 5: 대규모 유출 사고, 과징금·제재 처분, 법령·고시 개정 확정
 - 3~4: 조사 착수, 제도 예고, 주요 기관의 정책 발표, 중대한 취약점 공개
 - 1~2: 행사·공모전, 협약, 일반 동향 소개
+
+구획(sections) 판단 — 법적 근거로 구분합니다:
+- '개인정보 유출 사고': 개인정보(이름·연락처·주민번호 등 식별정보)가 실제로 외부에
+  노출·유출됐다고 기사에 나옵니다(개인정보보호법상 유출 신고 대상).
+- '사이버보안 침해사고': 해킹·랜섬웨어·디도스 등 공격·침투 자체가 핵심이고,
+  개인정보 노출 여부는 불명확하거나 언급되지 않습니다(정보통신망법상 침해사고
+  신고 대상). 유출 여부와 무관하게 성립합니다.
+- 한 사건에 유출과 침해가 둘 다 명확히 나오면(예: 해킹으로 개인정보 유출) 두
+  구획 모두에 넣습니다. 법적 근거가 다른 별개 의무라 하나만 고르면 담당자가
+  다른 쪽을 놓칠 수 있으니, 억지로 하나만 고르지 마세요.
+- '동향': 위 둘 다 아닌 모든 것 — 정부기관(개인정보보호위원회 등) 움직임, 법·제도
+  개정, 산업계 보안 투자·제품 동향, 국제 사례 등.
+- 이미 알려진 사건의 후속 보도(소송, 과징금 확정, 국정감사 질의응답 등)는 사건
+  규모가 크지 않다면(중요도 3 이하이고 보도한 언론사가 적다면) '동향'으로
+  보냅니다. 다만 사회적으로 이미 큰 사건이라면(중요도 4~5이거나 여러 언론사가
+  계속 다루는 사건) 후속 보도라도 원래 사고 구획(유출/침해)에 그대로 둡니다.
 
 요약:
 - 후보 목록에 실제로 나온 사실만 씁니다. 추측하거나 없는 수치를 만들지 마세요.
@@ -1064,10 +1098,17 @@ def build_stories(
         used.add(index)
         used.update(related_indexes)
         importance = entry.get("importance")
+        raw_sections = entry.get("sections", [])
+        preset_sections = tuple(
+            dict.fromkeys(
+                value for value in raw_sections if value in REPORT_SECTIONS
+            )
+        ) if isinstance(raw_sections, list) else ()
         stories.append(
             prefer_original_outlet(
                 Story(
-                    # 구획은 검색 키워드에서 나중에 채운다.
+                    # 실제 구획은 group_sections에서 preset_sections 또는
+                    # classify_sections로 정한다.
                     section="",
                     headline=clean_text(str(entry.get("headline", "")))
                     or articles[index].title,
@@ -1075,6 +1116,7 @@ def build_stories(
                     importance=importance if isinstance(importance, int) else 3,
                     representative=articles[index],
                     related=tuple(articles[value] for value in related_indexes),
+                    preset_sections=preset_sections,
                 )
             )
         )
@@ -1189,12 +1231,12 @@ def story_heat(story: Story) -> tuple[int, float]:
     return score, published.timestamp()
 
 
-def apply_feedback(stories: list[Story], signals: list[dict[str, object]], keywords: list[str]) -> list[Story]:
+def apply_feedback(stories: list[Story], signals: list[dict[str, object]]) -> list[Story]:
     """누적 평가를 점수에 반영하고 반복적으로 싫어한 유형은 제외한다."""
     adjusted: list[Story] = []
     for story in stories:
         current_id = article_id(story.representative)
-        section = story_section(story, keywords)
+        sections = story_sections(story)
         tokens = story_tokens(f"{story.headline} {story.summary}")
         score = exact_down = similar_down = weak_source_down = 0
         for signal in signals:
@@ -1205,7 +1247,7 @@ def apply_feedback(stories: list[Story], signals: list[dict[str, object]], keywo
             if str(signal.get("article_id", "")) == current_id:
                 score += sign * count * (18 if sign > 0 else 25)
                 exact_down += count if sign < 0 else 0
-            if str(signal.get("topic", "")) == section:
+            if str(signal.get("topic", "")) in sections:
                 score += sign * min(count * 2, 8)
             old_tokens = story_tokens(str(signal.get("title", "")))
             overlap = len(tokens & old_tokens) / max(1, min(len(tokens), len(old_tokens)))
@@ -1330,45 +1372,77 @@ def merge_duplicate_stories(stories: list[Story]) -> list[Story]:
     return merged
 
 
-OTHER_SECTION = "기타"
+SECTION_LEAK = "개인정보 유출 사고"
+SECTION_BREACH = "사이버보안 침해사고"
+SECTION_TREND = "동향"
+# 표시 구획은 검색 키워드가 아니라 내용으로 정하는 고정된 세 가지뿐이다.
+REPORT_SECTIONS = [SECTION_LEAK, SECTION_BREACH, SECTION_TREND]
+
+# 개인정보가 외부로 나간 결과(개인정보보호법상 유출 신고 대상)를 가리키는 표현.
+LEAK_SIGNALS = ("유출", "노출")
+# 공격·침투 자체(정보통신망법상 침해사고 신고 대상)를 가리키는 표현. 개인정보
+# 유출 여부와 무관하게 성립한다.
+BREACH_SIGNALS = (
+    "해킹", "침해", "랜섬웨어", "디도스", "피싱", "스미싱", "악성코드", "취약점",
+    "사이버공격", "사이버 공격",
+)
+# 이미 알려진 사건의 행정·사법 후속 처리를 가리키는 표현. 사건 규모가 작으면
+# 더 이상 "사고" 섹션에 둘 이유가 없어 동향으로 옮긴다.
+FOLLOWUP_SIGNALS = (
+    "소송", "손해배상", "항소", "국정감사", "국감", "질의", "확정판결",
+)
+# 이 이상이면 후속 보도라도 담당자가 계속 추적해야 할 "대형 사건"으로 본다.
+LARGE_SCALE_IMPORTANCE = 4
+LARGE_SCALE_COVERAGE = 5
 
 
-def story_section(story: Story, keywords: list[str]) -> str:
-    """사건이 속할 구획을 정한다.
+def classify_sections(story: Story) -> tuple[str, ...]:
+    """사건 본문을 보고 유출사고·침해사고·동향 구획을 정한다.
 
-    여러 키워드에 걸리면 그 사건을 가장 많이 찾아낸 키워드를 쓴다. 키워드
-    순서만으로 정하면 목록 앞에 있는 키워드가 무관한 사건까지 가져간다.
+    개인정보보호법(유출)과 정보통신망법(침해)은 법적 근거가 달라 한 사건이
+    둘 다에 해당할 수 있다. 억지로 하나만 고르면 담당자가 다른 쪽 의무를
+    놓칠 수 있으므로, 둘 다 뚜렷하면 두 구획 모두에 넣는다. 다만 이미 알려진
+    사건의 소송·국감 같은 후속 보도는, 사건 규모가 크지 않다면 더 이상
+    "사고"가 아니라 "동향"으로 본다.
     """
-    hits: dict[str, int] = {}
-    for article in story.articles:
-        for keyword in article.keywords:
-            hits[keyword] = hits.get(keyword, 0) + 1
-    if not hits:
-        return OTHER_SECTION
-    ranked = [keyword for keyword in keywords if keyword in hits]
-    if not ranked:
-        return OTHER_SECTION
-    # 동률이면 키워드를 준 순서를 따른다.
-    return max(ranked, key=lambda keyword: (hits[keyword], -keywords.index(keyword)))
+    text = f"{story.headline} {story.summary}".casefold()
+    has_leak = any(term in text for term in LEAK_SIGNALS)
+    has_breach = any(term in text for term in BREACH_SIGNALS)
+    is_followup = any(term in text for term in FOLLOWUP_SIGNALS)
+    large_scale = (
+        story.importance >= LARGE_SCALE_IMPORTANCE
+        or len(story.articles) >= LARGE_SCALE_COVERAGE
+    )
+
+    if is_followup and not large_scale:
+        return (SECTION_TREND,)
+
+    sections = tuple(
+        section
+        for section, matched in ((SECTION_LEAK, has_leak), (SECTION_BREACH, has_breach))
+        if matched
+    )
+    return sections or (SECTION_TREND,)
 
 
-def group_sections(
-    stories: Iterable[Story], keywords: list[str]
-) -> dict[str, list[Story]]:
-    """Story를 검색 키워드별 구획으로 묶고 화제성 순으로 정렬한다.
+def story_sections(story: Story) -> tuple[str, ...]:
+    """Claude가 직접 판단해 돌려준 구획이 있으면 그대로 쓰고, 없으면 휴리스틱을 쓴다."""
+    return story.preset_sections or classify_sections(story)
 
-    구획 안에서도, 구획끼리도 지금 가장 이슈인 사건이 앞에 온다. 한 기사가
-    여러 키워드에 걸려도 구획 하나에만 넣으므로 같은 사건이 두 번 나오지 않는다.
+
+def group_sections(stories: Iterable[Story]) -> dict[str, list[Story]]:
+    """Story를 유출사고·침해사고·동향 구획으로 묶고 화제성 순으로 정렬한다.
+
+    한 사건이 두 법적 근거에 모두 해당하면 두 구획 모두에 넣는다(의도적인
+    중복 노출). 구획끼리도 지금 가장 이슈인 사건을 품은 쪽이 앞에 온다.
     """
-    grouped: dict[str, list[Story]] = {keyword: [] for keyword in keywords}
+    grouped: dict[str, list[Story]] = {name: [] for name in REPORT_SECTIONS}
     for story in stories:
-        section = story_section(story, keywords)
-        grouped.setdefault(section, []).append(replace(story, section=section))
+        for section in story_sections(story):
+            grouped.setdefault(section, []).append(replace(story, section=section))
     for entries in grouped.values():
         entries.sort(key=story_heat, reverse=True)
 
-    # 가장 이슈인 사건을 품은 구획을 앞에 놓고, 결과가 없는 구획은 뒤로 보낸다.
-    # 빈 구획도 남겨 어떤 주제를 검색했는지 보이게 한다.
     def section_heat(entries: list[Story]) -> tuple[int, float]:
         return max((story_heat(story) for story in entries), default=(0, 0.0))
 
@@ -1382,26 +1456,33 @@ def select_balanced_stories(
 ) -> dict[str, list[Story]]:
     """전체 한도 안에서 구획마다 최소 한 자리를 보장하며 사건을 고른다.
 
-    화제성 순으로 전체를 한 번에 자르면 보도량이 큰 구획(유출 사고, AI 보안)이
-    자리를 거의 다 가져가, 후보가 분명히 있는 구획도 0건으로 보일 수 있다.
-    후보가 있는 구획에는 먼저 한 자리씩 주고, 남는 자리만 화제성 순으로 채운다.
+    화제성 순으로 전체를 한 번에 자르면 보도량이 큰 구획이 자리를 거의 다
+    가져가, 후보가 분명히 있는 구획도 0건으로 보일 수 있다. 후보가 있는
+    구획에는 먼저 한 자리씩 주고, 남는 자리만 화제성 순으로 채운다.
+
+    같은 사건이 유출·침해 두 구획에 동시에 실려도 전체 한도는 한 자리만
+    쓴다 — 의도적인 중복 노출이지, 다른 사건의 자리를 빼앗으면 안 된다.
     """
     remaining = {key: list(entries) for key, entries in sections.items()}
     selected: dict[str, list[Story]] = {key: [] for key in sections}
-    count = 0
+    seen_events: set[str] = set()
+
+    def admit(key: str, story: Story) -> None:
+        selected[key].append(story)
+        seen_events.add(article_id(story.representative))
+
+    def budget_used() -> int:
+        return len(seen_events)
+
     for key, entries in remaining.items():
-        if count >= limit:
-            break
-        if entries:
-            selected[key].append(entries.pop(0))
-            count += 1
+        if entries and budget_used() < limit:
+            admit(key, entries.pop(0))
     pool = [(key, story) for key, entries in remaining.items() for story in entries]
     pool.sort(key=lambda item: story_heat(item[1]), reverse=True)
     for key, story in pool:
-        if count >= limit:
-            break
-        selected[key].append(story)
-        count += 1
+        if budget_used() >= limit and article_id(story.representative) not in seen_events:
+            continue
+        admit(key, story)
     for entries in selected.values():
         entries.sort(key=story_heat, reverse=True)
     return selected
@@ -1997,8 +2078,8 @@ def build_report(
     stories, curator = curate(relevant, curation_limit, api_key)
     stories = merge_duplicate_stories(stories)
     signals = load_feedback_signals(feedback_api_url, timeout)
-    stories = apply_feedback(stories, signals, keywords)
-    sections = group_sections(stories, keywords)
+    stories = apply_feedback(stories, signals)
+    sections = group_sections(stories)
     sections = select_balanced_stories(sections, limit)
     if signals:
         print(f"[피드백] 누적 평가 신호 {len(signals)}개를 선별 순위에 반영했습니다.")

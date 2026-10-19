@@ -419,32 +419,45 @@ class CurationTests(unittest.TestCase):
         self.assertEqual([], stories)
         self.assertEqual(app.HEURISTIC_CURATOR, curator)
 
-    def test_group_sections_keeps_empty_keywords_at_the_end(self):
-        stories = app.build_stories(self.payload(), self.candidates, limit=12)
-
-        sections = app.group_sections(stories, ["개인정보보호법", "AI 보안", "개보위"])
-
-        self.assertEqual(1, len(sections["개인정보보호법"]))
-        self.assertEqual(1, len(sections["AI 보안"]))
-        # 결과가 없는 키워드도 구획으로 남지만 뒤로 밀린다.
-        self.assertEqual([], sections["개보위"])
-        self.assertEqual("개보위", list(sections)[-1])
-        self.assertEqual("개인정보보호법", sections["개인정보보호법"][0].section)
-
-    def test_hotter_section_comes_first_regardless_of_keyword_order(self):
-        cool = article("작은 사건", "https://a.test/1", self.now, keywords=("앞 키워드",))
-        hot = article("큰 사건", "https://a.test/2", self.now, keywords=("뒤 키워드",))
+    def test_group_sections_keeps_empty_sections_at_the_end(self):
+        # 어느 후보에도 "유출"·"침해" 신호가 없으면 전부 동향으로 간다.
+        quiet = article("공모전 개최", "https://a.test/1", self.now)
         payload = {
             "stories": [
                 {
-                    "headline": "작은 사건",
+                    "headline": "공모전 개최",
+                    "summary": "",
+                    "importance": 1,
+                    "representative": 0,
+                    "related": [],
+                }
+            ]
+        }
+        stories = app.build_stories(payload, [quiet], limit=12)
+
+        sections = app.group_sections(stories)
+
+        self.assertEqual(sorted(app.REPORT_SECTIONS), sorted(sections))
+        self.assertEqual(1, len(sections[app.SECTION_TREND]))
+        # 결과가 없는 구획도 남지만 뒤로 밀린다.
+        self.assertEqual([], sections[app.SECTION_LEAK])
+        self.assertEqual([], sections[app.SECTION_BREACH])
+        self.assertEqual(app.SECTION_TREND, sections[app.SECTION_TREND][0].section)
+
+    def test_hotter_section_comes_first_regardless_of_definition_order(self):
+        cool_breach = article("작은 해킹 시도 적발", "https://a.test/1", self.now)
+        hot_leak = article("대규모 개인정보 유출 확인", "https://a.test/2", self.now)
+        payload = {
+            "stories": [
+                {
+                    "headline": "작은 해킹 시도 적발",
                     "summary": "",
                     "importance": 2,
                     "representative": 0,
                     "related": [],
                 },
                 {
-                    "headline": "큰 사건",
+                    "headline": "대규모 개인정보 유출 확인",
                     "summary": "",
                     "importance": 5,
                     "representative": 1,
@@ -452,47 +465,44 @@ class CurationTests(unittest.TestCase):
                 },
             ]
         }
-        stories = app.build_stories(payload, [cool, hot], limit=12)
+        stories = app.build_stories(payload, [cool_breach, hot_leak], limit=12)
 
-        sections = app.group_sections(stories, ["앞 키워드", "뒤 키워드"])
+        sections = app.group_sections(stories)
 
-        # 키워드 순서보다 화제성이 앞선다.
-        self.assertEqual(["뒤 키워드", "앞 키워드"], list(sections))
+        # SECTION_LEAK이 SECTION_BREACH보다 뒤에 정의돼 있어도(REPORT_SECTIONS
+        # 순서) 화제성이 더 큰 쪽이 앞선다.
+        self.assertEqual(app.SECTION_LEAK, list(sections)[0])
 
-    def test_a_story_matching_two_keywords_lands_in_one_section_only(self):
-        # 개인정보보호위원회와 개보위는 같은 기관이라 한 기사가 둘 다에 걸린다.
-        overlapping = article(
-            "개인정보위 전체회의 의결",
-            "https://a.test/9",
-            self.now,
-            "연합뉴스",
-            keywords=("개보위", "개인정보보호위원회"),
+    def test_a_story_matching_leak_and_breach_signals_appears_in_both_sections(self):
+        # 개인정보보호법(유출)과 정보통신망법(침해)은 법적 근거가 달라, 해킹으로
+        # 개인정보가 유출된 사건은 둘 다에 해당하므로 두 구획 모두에 실려야 한다.
+        both = article(
+            "해킹으로 고객 개인정보 유출", "https://a.test/9", self.now, "연합뉴스"
         )
         payload = {
             "stories": [
                 {
-                    "headline": "개인정보위 전체회의 의결",
-                    "summary": "의결했다.",
+                    "headline": "해킹으로 고객 개인정보 유출",
+                    "summary": "공격자가 침투해 개인정보를 빼갔다.",
                     "importance": 4,
                     "representative": 0,
                     "related": [],
                 }
             ]
         }
-        stories = app.build_stories(payload, [overlapping], limit=12)
+        stories = app.build_stories(payload, [both], limit=12)
 
-        sections = app.group_sections(stories, ["개인정보보호위원회", "개보위"])
+        sections = app.group_sections(stories)
 
-        # 앞선 키워드의 구획에만 들어가고 중복 노출되지 않는다.
-        self.assertEqual(1, len(sections["개인정보보호위원회"]))
-        self.assertEqual([], sections["개보위"])
+        self.assertEqual(1, len(sections[app.SECTION_LEAK]))
+        self.assertEqual(1, len(sections[app.SECTION_BREACH]))
 
-    def test_stories_without_a_known_keyword_go_to_the_other_section(self):
-        orphan = article("출처 불명 사건", "https://a.test/8", self.now)
+    def test_stories_without_incident_signals_go_to_trend(self):
+        orphan = article("업계 보안 투자 확대 전망", "https://a.test/8", self.now)
         payload = {
             "stories": [
                 {
-                    "headline": "출처 불명 사건",
+                    "headline": "업계 보안 투자 확대 전망",
                     "summary": "",
                     "importance": 3,
                     "representative": 0,
@@ -502,10 +512,45 @@ class CurationTests(unittest.TestCase):
         }
         stories = app.build_stories(payload, [orphan], limit=12)
 
-        sections = app.group_sections(stories, ["개인정보보호법"])
+        sections = app.group_sections(stories)
 
-        self.assertEqual([], sections["개인정보보호법"])
-        self.assertEqual(1, len(sections[app.OTHER_SECTION]))
+        self.assertEqual([], sections[app.SECTION_LEAK])
+        self.assertEqual([], sections[app.SECTION_BREACH])
+        self.assertEqual(1, len(sections[app.SECTION_TREND]))
+
+    def test_small_scale_followup_moves_to_trend_but_large_scale_stays(self):
+        small = article(
+            "작년 유출 사고 관련 소송 결과", "https://a.test/10", self.now
+        )
+        large = article(
+            "대규모 유출 사고 관련 집단소송 제기", "https://a.test/11", self.now
+        )
+        payload = {
+            "stories": [
+                {
+                    "headline": "작년 유출 사고 관련 소송 결과",
+                    "summary": "법원이 판단했다.",
+                    "importance": 2,
+                    "representative": 0,
+                    "related": [],
+                },
+                {
+                    "headline": "대규모 유출 사고 관련 집단소송 제기",
+                    "summary": "피해자들이 집단소송을 냈다.",
+                    "importance": 5,
+                    "representative": 1,
+                    "related": [],
+                },
+            ]
+        }
+        stories = app.build_stories(payload, [small, large], limit=12)
+
+        sections = app.group_sections(stories)
+
+        headlines_in_trend = {story.headline for story in sections[app.SECTION_TREND]}
+        headlines_in_leak = {story.headline for story in sections[app.SECTION_LEAK]}
+        self.assertIn("작년 유출 사고 관련 소송 결과", headlines_in_trend)
+        self.assertIn("대규모 유출 사고 관련 집단소송 제기", headlines_in_leak)
 
     def test_merge_keeps_every_keyword_that_found_the_article(self):
         first = article(
