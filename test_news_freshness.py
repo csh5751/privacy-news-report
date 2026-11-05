@@ -1264,6 +1264,18 @@ class OfficialDocumentTests(unittest.TestCase):
 
         self.assertEqual(["개인정보 보호 지침 개정"], [a.title for a in found])
 
+    def test_already_sent_documents_can_be_listed_separately(self):
+        found = app.parse_official_board(self.PIPC_HTML, self.board)
+        sent_keys = app.article_keys(found[0])
+
+        fresh = app.official_stories(found, excluded_keys=sent_keys, now=self.now)
+        sent = app.official_stories(
+            found, excluded_keys=sent_keys, now=self.now, already_sent=True
+        )
+
+        self.assertEqual([], fresh)
+        self.assertEqual(1, len(sent))
+
     def test_date_only_publication_is_shown_without_a_made_up_time(self):
         self.assertEqual(
             "2026-11-05", app.format_date(datetime(2026, 11, 5, tzinfo=app.KST))

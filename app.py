@@ -1657,10 +1657,12 @@ def official_stories(
     articles: Iterable[Article],
     excluded_keys: set[str] | None = None,
     now: datetime | None = None,
+    already_sent: bool = False,
 ) -> list[Story]:
-    """시간 창 안에 올라온 새 공식 문서를 곧바로 공식 문서 구획의 Story로 만든다.
+    """시간 창 안에 올라온 공식 문서를 곧바로 공식 문서 구획의 Story로 만든다.
 
     기관이 직접 올린 글이라 뉴스처럼 관련성을 걸러내거나 묶을 필요가 없다.
+    already_sent가 거짓이면 아직 안 보낸 문서만, 참이면 이미 보낸 문서만 돌려준다.
     """
     current = now or datetime.now(timezone.utc)
     start = current - timedelta(hours=OFFICIAL_WINDOW_HOURS)
@@ -1672,7 +1674,7 @@ def official_stories(
             continue
         if article.published < start or article.published > current + timedelta(days=1):
             continue
-        if article_keys(article) & excluded:
+        if bool(article_keys(article) & excluded) != already_sent:
             continue
         seen_links.add(article.link)
         important = any(term in article.title for term in OFFICIAL_IMPORTANT_TERMS)
@@ -2403,6 +2405,7 @@ def build_report(
     stories = merge_duplicate_stories(stories)
     official_pool, official_failures = collect_official_documents(timeout)
     new_official = official_stories(official_pool, excluded_keys)
+    official_sent = official_stories(official_pool, excluded_keys, already_sent=True)
     print(f"[공식 문서] 새 공식 문서 {len(new_official)}건")
     stories = stories + new_official
     signals = load_feedback_signals(feedback_api_url, timeout)
@@ -2418,6 +2421,9 @@ def build_report(
     # 제목과 보도량만 있으면 되고, 묶는 데는 규칙만으로 충분하다.
     # 몇 개 사건을 못 실었는지 알려면 자르기 전에 전체를 묶어야 한다.
     clustered = curate_heuristically(seen, len(seen)) if seen else []
+    # 이미 보낸 공식 문서도 시간 창 안이면 함께 적는다. 안 그러면 보낸 직후부터
+    # 보고서의 공식 문서 구획이 비어 "올라온 문서가 없다"는 오해를 준다.
+    clustered = official_sent + clustered
     revisited = clustered[:REVISITED_LIMIT]
 
     stats = RunStats(
