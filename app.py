@@ -42,6 +42,11 @@ DEFAULT_KEYWORDS = [
     "AI 보안",
     "사이버보안 침해사고",
     "다크웹 개인정보 거래",
+    # 정부·유관기관이 배포한 공식 문서(해설서·가이드라인·고시 등) 소식을 찾는 키워드.
+    "개인정보 안전성 확보조치 기준 해설서",
+    "개인정보보호위원회 가이드라인 안내서 개정",
+    "한국인터넷진흥원 KISA 보안 가이드 안내서 배포",
+    "정보보호 고시 행정예고 개정",
 ]
 TAG_RE = re.compile(r"<[^>]+>")
 SPACE_RE = re.compile(r"\s+")
@@ -69,6 +74,7 @@ RELEVANCE_STRONG_SIGNALS = (
     "피싱", "스미싱", "악성코드", "디도스", "위반", "집단소송", "손해배상",
     "보상안", "사과", "개인정보", "프라이버시", "가명정보",
     "마이데이터", "cpo", "gdpr", "개보위", "감독", "보안사고", "정보통신망법",
+    "해설서", "가이드라인", "안내서", "행정예고",
 )
 # 보안·개인정보가 주제이긴 하지만 그 자체로는 사건인지 알 수 없는 표현.
 # 홍보·시황성 기사에도 흔히 섞여 들어가므로 노이즈와 맞서는 약한 신호로만 둔다.
@@ -972,11 +978,18 @@ CURATION_SCHEMA = {
                             "이 사건이 속할 구획. 개인정보보호법상 유출 신고 대상이면"
                             " '개인정보 유출 사고', 정보통신망법상 침해사고 신고 대상이면"
                             " '사이버보안 침해사고', 둘 다 해당하면 둘 다 넣는다."
-                            " 둘 다 아니면 '동향' 하나만 넣는다."
+                            " 정부·유관기관이 배포한 공식 문서(해설서·가이드라인·고시 등)"
+                            " 소식이면 '공식 문서·가이드'를 넣는다."
+                            " 어디에도 해당하지 않으면 '동향' 하나만 넣는다."
                         ),
                         "items": {
                             "type": "string",
-                            "enum": ["개인정보 유출 사고", "사이버보안 침해사고", "동향"],
+                            "enum": [
+                                "개인정보 유출 사고",
+                                "사이버보안 침해사고",
+                                "공식 문서·가이드",
+                                "동향",
+                            ],
                         },
                         "minItems": 1,
                     },
@@ -1038,7 +1051,12 @@ CURATION_SYSTEM_PROMPT = """\
 - 한 사건에 유출과 침해가 둘 다 명확히 나오면(예: 해킹으로 개인정보 유출) 두
   구획 모두에 넣습니다. 법적 근거가 다른 별개 의무라 하나만 고르면 담당자가
   다른 쪽을 놓칠 수 있으니, 억지로 하나만 고르지 마세요.
-- '동향': 위 둘 다 아닌 모든 것 — 정부기관(개인정보보호위원회 등) 움직임, 법·제도
+- '공식 문서·가이드': 개인정보보호위원회·KISA·과기정통부·금융당국 등 정부나 유관기관이
+  해설서·가이드라인·안내서·고시·행정예고 같은 공식 문서를 새로 배포하거나 개정했다는
+  소식입니다(예: 개인정보의 안전성 확보조치 기준 해설서 개정). 문서 이름과 배포
+  기관이 기사에 드러나야 하며, 단순 정책 발언이나 사고 기사는 해당하지 않습니다.
+  요약에는 문서 이름과 배포 기관, 바뀐 핵심을 적습니다.
+- '동향': 위에 해당하지 않는 모든 것 — 정부기관(개인정보보호위원회 등) 움직임, 법·제도
   개정, 산업계 보안 투자·제품 동향, 국제 사례 등.
 - 이미 알려진 사건의 후속 보도(소송, 과징금 확정, 국정감사 질의응답 등)는 사건
   규모가 크지 않다면(중요도 3 이하이고 보도한 언론사가 적다면) '동향'으로
@@ -1374,9 +1392,10 @@ def merge_duplicate_stories(stories: list[Story]) -> list[Story]:
 
 SECTION_LEAK = "개인정보 유출 사고"
 SECTION_BREACH = "사이버보안 침해사고"
+SECTION_OFFICIAL = "공식 문서·가이드"
 SECTION_TREND = "동향"
-# 표시 구획은 검색 키워드가 아니라 내용으로 정하는 고정된 세 가지뿐이다.
-REPORT_SECTIONS = [SECTION_LEAK, SECTION_BREACH, SECTION_TREND]
+# 표시 구획은 검색 키워드가 아니라 내용으로 정하는 고정된 네 가지뿐이다.
+REPORT_SECTIONS = [SECTION_LEAK, SECTION_BREACH, SECTION_OFFICIAL, SECTION_TREND]
 
 # 개인정보가 외부로 나간 결과(개인정보보호법상 유출 신고 대상)를 가리키는 표현.
 LEAK_SIGNALS = ("유출", "노출")
@@ -1385,6 +1404,19 @@ LEAK_SIGNALS = ("유출", "노출")
 BREACH_SIGNALS = (
     "해킹", "침해", "랜섬웨어", "디도스", "피싱", "스미싱", "악성코드", "취약점",
     "사이버공격", "사이버 공격",
+)
+# 정부·유관기관이 배포하는 공식 문서의 종류를 가리키는 표현. 제목에 있어야
+# 문서 자체가 소식인 기사로 본다(사고 기사 본문에 스치듯 나오는 경우는 제외).
+OFFICIAL_DOC_SIGNALS = (
+    "해설서", "가이드라인", "안내서", "가이드", "지침", "매뉴얼", "백서",
+    "행정예고", "고시", "표준 개인정보", "점검표", "체크리스트",
+)
+# 공식 문서를 내는 정부기관·유관기관.
+OFFICIAL_BODY_SIGNALS = (
+    "개인정보보호위원회", "개인정보위", "개보위", "한국인터넷진흥원", "kisa",
+    "과학기술정보통신부", "과기정통부", "행정안전부", "행안부", "금융위원회",
+    "금융감독원", "금감원", "금융보안원", "국가정보원", "국정원", "국가사이버안보센터",
+    "방송통신위원회", "한국지능정보사회진흥원",
 )
 # 이미 알려진 사건의 행정·사법 후속 처리를 가리키는 표현. 사건 규모가 작으면
 # 더 이상 "사고" 섹션에 둘 이유가 없어 동향으로 옮긴다.
@@ -1406,6 +1438,11 @@ def classify_sections(story: Story) -> tuple[str, ...]:
     "사고"가 아니라 "동향"으로 본다.
     """
     text = f"{story.headline} {story.summary}".casefold()
+    headline = story.headline.casefold()
+    # 문서 이름이 제목에 있고 배포 주체가 본문에 있으면 공식 문서 소식이다.
+    is_official = any(term in headline for term in OFFICIAL_DOC_SIGNALS) and any(
+        term in text for term in OFFICIAL_BODY_SIGNALS
+    )
     has_leak = any(term in text for term in LEAK_SIGNALS)
     has_breach = any(term in text for term in BREACH_SIGNALS)
     is_followup = any(term in text for term in FOLLOWUP_SIGNALS)
@@ -1419,7 +1456,11 @@ def classify_sections(story: Story) -> tuple[str, ...]:
 
     sections = tuple(
         section
-        for section, matched in ((SECTION_LEAK, has_leak), (SECTION_BREACH, has_breach))
+        for section, matched in (
+            (SECTION_LEAK, has_leak),
+            (SECTION_BREACH, has_breach),
+            (SECTION_OFFICIAL, is_official),
+        )
         if matched
     )
     return sections or (SECTION_TREND,)
