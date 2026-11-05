@@ -22,7 +22,7 @@ from io import TextIOBase
 from pathlib import Path
 from typing import Callable, Iterable, TypeVar
 from urllib.error import HTTPError, URLError
-from urllib.parse import parse_qs, urlencode, urlparse, urlsplit, urlunsplit
+from urllib.parse import parse_qs, urlencode, urljoin, urlparse, urlsplit, urlunsplit
 from urllib.request import Request, urlopen
 from xml.etree import ElementTree
 
@@ -42,11 +42,6 @@ DEFAULT_KEYWORDS = [
     "AI 보안",
     "사이버보안 침해사고",
     "다크웹 개인정보 거래",
-    # 정부·유관기관이 배포한 공식 문서(해설서·가이드라인·고시 등) 소식을 찾는 키워드.
-    "개인정보 안전성 확보조치 기준 해설서",
-    "개인정보보호위원회 가이드라인 안내서 개정",
-    "한국인터넷진흥원 KISA 보안 가이드 안내서 배포",
-    "정보보호 고시 행정예고 개정",
 ]
 TAG_RE = re.compile(r"<[^>]+>")
 SPACE_RE = re.compile(r"\s+")
@@ -74,7 +69,6 @@ RELEVANCE_STRONG_SIGNALS = (
     "피싱", "스미싱", "악성코드", "디도스", "위반", "집단소송", "손해배상",
     "보상안", "사과", "개인정보", "프라이버시", "가명정보",
     "마이데이터", "cpo", "gdpr", "개보위", "감독", "보안사고", "정보통신망법",
-    "해설서", "가이드라인", "안내서", "행정예고",
 )
 # 보안·개인정보가 주제이긴 하지만 그 자체로는 사건인지 알 수 없는 표현.
 # 홍보·시황성 기사에도 흔히 섞여 들어가므로 노이즈와 맞서는 약한 신호로만 둔다.
@@ -167,6 +161,9 @@ class RunStats:
     stories: int = 0
     curator: str = ""
     failed_keywords: int = 0
+    # 정부·유관기관 게시판에서 새로 찾은 공식 문서 수와 읽지 못한 게시판 수.
+    official: int = 0
+    failed_official: int = 0
 
 
 @dataclass(frozen=True)
@@ -478,8 +475,8 @@ def post_kakao_form(
     return result
 
 
-def read_feed(url: str, timeout: float) -> ElementTree.Element:
-    """RSS 피드를 받아 파싱한 루트 엘리먼트를 반환한다."""
+def fetch_bytes(url: str, timeout: float) -> bytes:
+    """URL의 본문을 받는다. 인증서 문제가 있으면 시스템 curl로 다시 시도한다."""
     request = Request(url, headers={"User-Agent": USER_AGENT})
 
     raw_data: bytes
@@ -496,7 +493,12 @@ def read_feed(url: str, timeout: float) -> ElementTree.Element:
             raise RuntimeError(f"뉴스 서버에 연결할 수 없습니다: {reason}") from exc
     except TimeoutError as exc:
         raise RuntimeError("뉴스 요청 시간이 초과되었습니다.") from exc
+    return raw_data
 
+
+def read_feed(url: str, timeout: float) -> ElementTree.Element:
+    """RSS 피드를 받아 파싱한 루트 엘리먼트를 반환한다."""
+    raw_data = fetch_bytes(url, timeout)
     try:
         return ElementTree.fromstring(raw_data)
     except ElementTree.ParseError as exc:
@@ -978,18 +980,11 @@ CURATION_SCHEMA = {
                             "이 사건이 속할 구획. 개인정보보호법상 유출 신고 대상이면"
                             " '개인정보 유출 사고', 정보통신망법상 침해사고 신고 대상이면"
                             " '사이버보안 침해사고', 둘 다 해당하면 둘 다 넣는다."
-                            " 정부·유관기관이 배포한 공식 문서(해설서·가이드라인·고시 등)"
-                            " 소식이면 '공식 문서·가이드'를 넣는다."
-                            " 어디에도 해당하지 않으면 '동향' 하나만 넣는다."
+                            " 둘 다 아니면 '동향' 하나만 넣는다."
                         ),
                         "items": {
                             "type": "string",
-                            "enum": [
-                                "개인정보 유출 사고",
-                                "사이버보안 침해사고",
-                                "공식 문서·가이드",
-                                "동향",
-                            ],
+                            "enum": ["개인정보 유출 사고", "사이버보안 침해사고", "동향"],
                         },
                         "minItems": 1,
                     },
@@ -1051,12 +1046,7 @@ CURATION_SYSTEM_PROMPT = """\
 - 한 사건에 유출과 침해가 둘 다 명확히 나오면(예: 해킹으로 개인정보 유출) 두
   구획 모두에 넣습니다. 법적 근거가 다른 별개 의무라 하나만 고르면 담당자가
   다른 쪽을 놓칠 수 있으니, 억지로 하나만 고르지 마세요.
-- '공식 문서·가이드': 개인정보보호위원회·KISA·과기정통부·금융당국 등 정부나 유관기관이
-  해설서·가이드라인·안내서·고시·행정예고 같은 공식 문서를 새로 배포하거나 개정했다는
-  소식입니다(예: 개인정보의 안전성 확보조치 기준 해설서 개정). 문서 이름과 배포
-  기관이 기사에 드러나야 하며, 단순 정책 발언이나 사고 기사는 해당하지 않습니다.
-  요약에는 문서 이름과 배포 기관, 바뀐 핵심을 적습니다.
-- '동향': 위에 해당하지 않는 모든 것 — 정부기관(개인정보보호위원회 등) 움직임, 법·제도
+- '동향': 위 둘 다 아닌 모든 것 — 정부기관(개인정보보호위원회 등) 움직임, 법·제도
   개정, 산업계 보안 투자·제품 동향, 국제 사례 등.
 - 이미 알려진 사건의 후속 보도(소송, 과징금 확정, 국정감사 질의응답 등)는 사건
   규모가 크지 않다면(중요도 3 이하이고 보도한 언론사가 적다면) '동향'으로
@@ -1390,6 +1380,150 @@ def merge_duplicate_stories(stories: list[Story]) -> list[Story]:
     return merged
 
 
+@dataclass(frozen=True)
+class OfficialBoard:
+    """공식 문서가 올라오는 정부·유관기관 게시판 한 곳."""
+
+    agency: str
+    name: str
+    url: str
+
+
+# 뉴스 검색이 아니라 기관 게시판을 직접 읽는다. 목록 표(<tr>)에 제목 링크와
+# 날짜가 있는 게시판이면 같은 해석기로 읽히므로 게시판을 늘리기 쉽다.
+OFFICIAL_BOARDS = (
+    OfficialBoard(
+        "개인정보보호위원회",
+        "지침·가이드라인(안내서)",
+        "https://www.pipc.go.kr/np/cop/bbs/selectBoardList.do?bbsId=BS217&mCode=D010030000",
+    ),
+    OfficialBoard(
+        "개인정보보호위원회",
+        "훈령·예규·고시",
+        "https://www.pipc.go.kr/np/cop/bbs/selectBoardList.do?bbsId=BS216&mCode=D010020010",
+    ),
+    OfficialBoard("한국인터넷진흥원(KISA)", "가이드라인", "https://www.kisa.or.kr/2060207"),
+    OfficialBoard("한국인터넷진흥원(KISA)", "안내서", "https://www.kisa.or.kr/2060307"),
+)
+# 게시판은 날짜만 알려주고 올라오는 빈도도 낮다. 보낸 이력으로 중복을 막으므로
+# 뉴스보다 넉넉한 창을 쓴다.
+OFFICIAL_WINDOW_HOURS = 24 * 7
+OFFICIAL_ROW_RE = re.compile(r"<tr[\s>].*?</tr>", re.DOTALL | re.IGNORECASE)
+OFFICIAL_LINK_RE = re.compile(
+    r'<a\s[^>]*?href="([^"]+)"[^>]*>(.*?)</a>', re.DOTALL | re.IGNORECASE
+)
+OFFICIAL_DATE_RE = re.compile(r"(?<!\d)(20\d{2})[-.](\d{2})[-.](\d{2})(?!\d)")
+OFFICIAL_NEW_BADGE_RE = re.compile(r"\s+N$")
+# 이 표현이 제목에 있으면 기존 문서의 개정·새 해설서일 가능성이 커 중요도를 높인다.
+OFFICIAL_IMPORTANT_TERMS = ("해설서", "안내서", "가이드라인", "고시", "개정")
+
+
+def parse_official_board(markup: str, board: OfficialBoard) -> list[Article]:
+    """게시판 목록 HTML에서 (제목, 링크, 날짜)가 있는 행을 공식 문서로 뽑는다."""
+    articles: list[Article] = []
+    for row in OFFICIAL_ROW_RE.findall(markup):
+        date_match = OFFICIAL_DATE_RE.search(row)
+        if not date_match:
+            continue
+        link_match = next(
+            (
+                match
+                for match in OFFICIAL_LINK_RE.finditer(row)
+                if not match.group(1).startswith(("#", "javascript:"))
+                and clean_text(match.group(2))
+            ),
+            None,
+        )
+        if not link_match:
+            continue
+        title = OFFICIAL_NEW_BADGE_RE.sub("", clean_text(link_match.group(2)))
+        try:
+            published = datetime(*(int(part) for part in date_match.groups()), tzinfo=KST)
+        except ValueError:
+            continue
+        articles.append(
+            Article(
+                title=title,
+                link=urljoin(board.url, html.unescape(link_match.group(1))),
+                source=board.agency,
+                published=published,
+                description="",
+                keywords=(board.name,),
+            )
+        )
+    return articles
+
+
+def fetch_official_board(board: OfficialBoard, timeout: float) -> list[Article]:
+    raw = fetch_bytes(board.url, timeout)
+    try:
+        markup = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        markup = raw.decode("cp949", errors="replace")
+    articles = parse_official_board(markup, board)
+    if not articles:
+        # 화면 구조가 바뀌면 조용히 0건이 되므로 읽지 못한 것으로 알린다.
+        raise RuntimeError(f"{board.agency} {board.name} 게시판에서 글을 읽지 못했습니다.")
+    return articles
+
+
+def collect_official_documents(timeout: float) -> tuple[list[Article], int]:
+    """모든 공식 게시판의 글을 모은다. 반환값은 (문서, 읽지 못한 게시판 수)."""
+    pool: list[Article] = []
+    failures = 0
+    for board in OFFICIAL_BOARDS:
+        print(f"[공식 문서] {board.agency} {board.name}")
+        try:
+            found = retry_operation(
+                f"공식 문서 수집({board.agency} {board.name})",
+                lambda board=board: fetch_official_board(board, timeout),
+            )
+        except RuntimeError as exc:
+            failures += 1
+            print(f"[경고] {board.agency} {board.name}: {exc}", file=sys.stderr)
+            continue
+        print(f"[공식 문서] {board.agency} {board.name}: {len(found)}건")
+        pool.extend(found)
+    return pool, failures
+
+
+def official_stories(
+    articles: Iterable[Article],
+    excluded_keys: set[str] | None = None,
+    now: datetime | None = None,
+) -> list[Story]:
+    """시간 창 안에 올라온 새 공식 문서를 곧바로 공식 문서 구획의 Story로 만든다.
+
+    기관이 직접 올린 글이라 뉴스처럼 관련성을 걸러내거나 묶을 필요가 없다.
+    """
+    current = now or datetime.now(timezone.utc)
+    start = current - timedelta(hours=OFFICIAL_WINDOW_HOURS)
+    excluded = excluded_keys or set()
+    stories: list[Story] = []
+    seen_links: set[str] = set()
+    for article in articles:
+        if article.published is None or article.link in seen_links:
+            continue
+        if article.published < start or article.published > current + timedelta(days=1):
+            continue
+        if article_keys(article) & excluded:
+            continue
+        seen_links.add(article.link)
+        important = any(term in article.title for term in OFFICIAL_IMPORTANT_TERMS)
+        stories.append(
+            Story(
+                section="",
+                headline=article.title,
+                summary=f"{article.source} 게시판({article.keywords[0]})에 올라온 공식 문서입니다.",
+                importance=4 if important else 3,
+                representative=article,
+                preset_sections=(SECTION_OFFICIAL,),
+            )
+        )
+    stories.sort(key=lambda story: story.representative.published, reverse=True)
+    return stories
+
+
 SECTION_LEAK = "개인정보 유출 사고"
 SECTION_BREACH = "사이버보안 침해사고"
 SECTION_OFFICIAL = "공식 문서·가이드"
@@ -1404,19 +1538,6 @@ LEAK_SIGNALS = ("유출", "노출")
 BREACH_SIGNALS = (
     "해킹", "침해", "랜섬웨어", "디도스", "피싱", "스미싱", "악성코드", "취약점",
     "사이버공격", "사이버 공격",
-)
-# 정부·유관기관이 배포하는 공식 문서의 종류를 가리키는 표현. 제목에 있어야
-# 문서 자체가 소식인 기사로 본다(사고 기사 본문에 스치듯 나오는 경우는 제외).
-OFFICIAL_DOC_SIGNALS = (
-    "해설서", "가이드라인", "안내서", "가이드", "지침", "매뉴얼", "백서",
-    "행정예고", "고시", "표준 개인정보", "점검표", "체크리스트",
-)
-# 공식 문서를 내는 정부기관·유관기관.
-OFFICIAL_BODY_SIGNALS = (
-    "개인정보보호위원회", "개인정보위", "개보위", "한국인터넷진흥원", "kisa",
-    "과학기술정보통신부", "과기정통부", "행정안전부", "행안부", "금융위원회",
-    "금융감독원", "금감원", "금융보안원", "국가정보원", "국정원", "국가사이버안보센터",
-    "방송통신위원회", "한국지능정보사회진흥원",
 )
 # 이미 알려진 사건의 행정·사법 후속 처리를 가리키는 표현. 사건 규모가 작으면
 # 더 이상 "사고" 섹션에 둘 이유가 없어 동향으로 옮긴다.
@@ -1438,11 +1559,6 @@ def classify_sections(story: Story) -> tuple[str, ...]:
     "사고"가 아니라 "동향"으로 본다.
     """
     text = f"{story.headline} {story.summary}".casefold()
-    headline = story.headline.casefold()
-    # 문서 이름이 제목에 있고 배포 주체가 본문에 있으면 공식 문서 소식이다.
-    is_official = any(term in headline for term in OFFICIAL_DOC_SIGNALS) and any(
-        term in text for term in OFFICIAL_BODY_SIGNALS
-    )
     has_leak = any(term in text for term in LEAK_SIGNALS)
     has_breach = any(term in text for term in BREACH_SIGNALS)
     is_followup = any(term in text for term in FOLLOWUP_SIGNALS)
@@ -1456,11 +1572,7 @@ def classify_sections(story: Story) -> tuple[str, ...]:
 
     sections = tuple(
         section
-        for section, matched in (
-            (SECTION_LEAK, has_leak),
-            (SECTION_BREACH, has_breach),
-            (SECTION_OFFICIAL, is_official),
-        )
+        for section, matched in ((SECTION_LEAK, has_leak), (SECTION_BREACH, has_breach))
         if matched
     )
     return sections or (SECTION_TREND,)
@@ -1591,6 +1703,9 @@ def format_date(value: datetime | None) -> str:
     if value is None:
         return "시각 미상"
     korea_time = value.astimezone(KST)
+    if (korea_time.hour, korea_time.minute) == (0, 0):
+        # 게시판 글은 날짜만 알려준다. 00:00 시각을 지어내 보여주지 않는다.
+        return korea_time.strftime("%Y-%m-%d")
     return korea_time.strftime("%Y-%m-%d %H:%M KST")
 
 
@@ -1633,6 +1748,8 @@ def notice_lines(stats: RunStats) -> list[str]:
     lines = [first, second]
     if stats.failed_keywords:
         lines.append(f"주제 {stats.failed_keywords}개는 수집에 실패했습니다.")
+    if stats.failed_official:
+        lines.append(f"공식 문서 게시판 {stats.failed_official}곳은 읽지 못했습니다.")
     return lines
 
 
@@ -2118,6 +2235,10 @@ def build_report(
     curation_limit = len(relevant)
     stories, curator = curate(relevant, curation_limit, api_key)
     stories = merge_duplicate_stories(stories)
+    official_pool, official_failures = collect_official_documents(timeout)
+    new_official = official_stories(official_pool, excluded_keys)
+    print(f"[공식 문서] 새 공식 문서 {len(new_official)}건")
+    stories = stories + new_official
     signals = load_feedback_signals(feedback_api_url, timeout)
     stories = apply_feedback(stories, signals)
     sections = group_sections(stories)
@@ -2142,6 +2263,8 @@ def build_report(
         stories=len(reported),
         curator=curator,
         failed_keywords=failures,
+        official=len(new_official),
+        failed_official=official_failures,
     )
     print(f"[정리] 구획 {filled}/{len(sections)}개 · 사건 {stats.stories}건")
     if clustered:

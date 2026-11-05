@@ -2,6 +2,7 @@ import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest import mock
 
 import app
 
@@ -1101,56 +1102,92 @@ class ParserTests(unittest.TestCase):
 
 
 class OfficialDocumentTests(unittest.TestCase):
+    PIPC_HTML = """
+    <table><tbody>
+      <tr><th>번호</th><th>제목</th></tr>
+      <tr>
+        <td class="boardTitle">
+          <a href="/np/cop/bbs/selectBoardArticle.do?bbsId=BS217&amp;nttId=12611">
+          [개정 안내서] 개인정보 안전성 확보조치 기준 해설서(2026.11.)
+          <span class="new">N</span></a>
+        </td>
+        <td>개인정보정책과</td><td>2026-11-05</td>
+        <td><a href="#download">첨부</a></td>
+      </tr>
+      <tr>
+        <td><a href="javascript:;">링크 없음</a></td><td>2026.10.26</td>
+      </tr>
+    </tbody></table>
+    """
+
     def setUp(self):
-        self.now = datetime(2026, 7, 1, 9, 0, tzinfo=timezone.utc)
+        self.now = datetime(2026, 11, 5, 1, 0, tzinfo=timezone.utc)
+        self.board = app.OfficialBoard(
+            "개인정보보호위원회", "지침·가이드라인", "https://www.pipc.go.kr/np/list.do"
+        )
 
-    def story(self, headline, summary="", preset=()):
-        item = article(headline, "https://a.test/1", self.now)
-        return app.Story(
+    def test_parse_board_reads_title_absolute_link_and_date(self):
+        found = app.parse_official_board(self.PIPC_HTML, self.board)
+
+        self.assertEqual(1, len(found))
+        self.assertEqual(
+            "[개정 안내서] 개인정보 안전성 확보조치 기준 해설서(2026.11.)", found[0].title
+        )
+        self.assertEqual(
+            "https://www.pipc.go.kr/np/cop/bbs/selectBoardArticle.do?bbsId=BS217&nttId=12611",
+            found[0].link,
+        )
+        self.assertEqual("개인정보보호위원회", found[0].source)
+        self.assertEqual(datetime(2026, 11, 5, tzinfo=app.KST), found[0].published)
+
+    def test_parse_board_accepts_dotted_dates(self):
+        html_text = '<tr><td><a href="/x/1">가이드</a></td><td>2026.10.26</td></tr>'
+
+        found = app.parse_official_board(html_text, self.board)
+
+        self.assertEqual(datetime(2026, 10, 26, tzinfo=app.KST), found[0].published)
+
+    def test_unreadable_board_is_reported_instead_of_returning_nothing(self):
+        with mock.patch.object(app, "fetch_bytes", return_value=b"<html>changed</html>"):
+            with self.assertRaises(RuntimeError):
+                app.fetch_official_board(self.board, timeout=1)
+
+    def test_recent_documents_become_official_stories(self):
+        found = app.parse_official_board(self.PIPC_HTML, self.board)
+
+        stories = app.official_stories(found, now=self.now)
+
+        self.assertEqual(1, len(stories))
+        self.assertEqual((app.SECTION_OFFICIAL,), stories[0].preset_sections)
+        self.assertEqual(4, stories[0].importance)
+        sections = app.group_sections(stories)
+        self.assertEqual(1, len(sections[app.SECTION_OFFICIAL]))
+
+    def test_old_or_already_sent_documents_are_skipped(self):
+        found = app.parse_official_board(self.PIPC_HTML, self.board)
+        old = app.official_stories(found, now=self.now + timedelta(days=30))
+        sent = app.official_stories(
+            found, excluded_keys=app.article_keys(found[0]), now=self.now
+        )
+
+        self.assertEqual([], old)
+        self.assertEqual([], sent)
+
+    def test_date_only_publication_is_shown_without_a_made_up_time(self):
+        self.assertEqual(
+            "2026-11-05", app.format_date(datetime(2026, 11, 5, tzinfo=app.KST))
+        )
+
+    def test_news_is_never_classified_as_official_document(self):
+        story = app.Story(
             section="",
-            headline=headline,
-            summary=summary,
+            headline="개인정보보호위원회 안전성 확보조치 해설서 개정",
+            summary="개보위가 해설서를 개정했다.",
             importance=3,
-            representative=item,
-            preset_sections=preset,
-        )
-
-    def test_guide_published_by_agency_goes_to_official_section(self):
-        story = self.story(
-            "개인정보의 안전성 확보조치 기준 해설서 개정",
-            "개인정보보호위원회가 해설서를 개정해 배포했다.",
-        )
-
-        self.assertEqual((app.SECTION_OFFICIAL,), app.classify_sections(story))
-
-    def test_document_word_without_issuing_body_stays_in_trend(self):
-        story = self.story("보안 가이드 세미나 안내", "민간 업체가 연다.")
-
-        self.assertEqual((app.SECTION_TREND,), app.classify_sections(story))
-
-    def test_incident_mentioning_guideline_only_in_body_is_not_official(self):
-        story = self.story(
-            "대규모 개인정보 유출 확인",
-            "개인정보보호위원회가 가이드라인 위반 여부를 조사한다.",
+            representative=article("x", "https://a.test/1", self.now),
         )
 
         self.assertNotIn(app.SECTION_OFFICIAL, app.classify_sections(story))
-
-    def test_claude_preset_official_section_is_kept_and_grouped(self):
-        story = self.story("KISA 클라우드 보안 안내서 공개", preset=(app.SECTION_OFFICIAL,))
-
-        sections = app.group_sections([story])
-
-        self.assertEqual(1, len(sections[app.SECTION_OFFICIAL]))
-        self.assertIn(app.SECTION_OFFICIAL, app.REPORT_SECTIONS)
-
-    def test_default_keywords_search_for_official_documents(self):
-        self.assertTrue(any("해설서" in keyword for keyword in app.DEFAULT_KEYWORDS))
-
-    def test_relevance_filter_keeps_official_document_news(self):
-        item = article("개인정보 안전성 확보조치 기준 해설서 배포", "https://a.test/1", self.now)
-
-        self.assertGreaterEqual(app.relevance_score(item), app.RELEVANCE_MIN_SCORE)
 
 
 if __name__ == "__main__":
