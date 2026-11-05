@@ -1,3 +1,4 @@
+import json
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -1172,6 +1173,96 @@ class OfficialDocumentTests(unittest.TestCase):
 
         self.assertEqual([], old)
         self.assertEqual([], sent)
+
+    def test_fsec_json_list_is_parsed_into_documents(self):
+        board = app.OfficialBoard(
+            "금융보안원", "가이드", "https://www.fsec.or.kr/bbs/222", kind="fsec"
+        )
+        payload = json.dumps(
+            {
+                "resultCode": "00",
+                "resultData": [
+                    {"bbsNo": 12056, "title": "클라우드 보안 안내서 (&#39;26년 개정판)", "regDate": "2026-08-28"},
+                    {"bbsNo": None, "title": "번호 없음", "regDate": "2026-08-28"},
+                ],
+            }
+        )
+
+        found = app.parse_fsec_board(payload, board)
+
+        self.assertEqual(1, len(found))
+        self.assertEqual("클라우드 보안 안내서 ('26년 개정판)", found[0].title)
+        self.assertEqual("https://www.fsec.or.kr/bbs/detail?menuNo=222&bbsNo=12056", found[0].link)
+
+    def test_fsec_garbage_response_yields_nothing(self):
+        board = app.OfficialBoard("금융보안원", "가이드", "https://www.fsec.or.kr/bbs/222", kind="fsec")
+
+        self.assertEqual([], app.parse_fsec_board("<html>", board))
+
+    def test_msit_script_list_is_parsed_in_row_order(self):
+        board = app.OfficialBoard(
+            "과학기술정보통신부",
+            "훈령·예규·고시",
+            "https://www.msit.go.kr/bbs/list.do?sCode=user&mPid=103&mId=108",
+            kind="msit",
+        )
+        markup = (
+            '<input name="bbsSeqNo" id="bbsSeqNo" value="83"/>'
+            '<a onclick="fn_detail(111);"></a><a onclick="fn_detail(222);"></a>'
+            "<script>"
+            "sHtml+= unescape('(과기정통부 고시) 정보보호 지침');" " sHtml+= newHtml;"
+            "$('#td_'+'REG_DT'+'_0').html('2026-10-26');"
+            "$('#td_'+'REG_DT'+'_0').html('Nov 4, 2026');"
+            "sHtml+= unescape('두 번째 글');" " sHtml+= newHtml;"
+            "$('#td_'+'REG_DT'+'_1').html('Oct 29, 2026');"
+            "</script>"
+        )
+
+        found = app.parse_msit_board(markup, board)
+
+        self.assertEqual(["(과기정통부 고시) 정보보호 지침", "두 번째 글"], [a.title for a in found])
+        self.assertEqual(datetime(2026, 11, 4, tzinfo=app.KST), found[0].published)
+        self.assertEqual(datetime(2026, 10, 29, tzinfo=app.KST), found[1].published)
+        self.assertEqual(
+            "https://www.msit.go.kr/bbs/view.do?sCode=user&mId=108&mPid=103&bbsSeqNo=83&nttSeqNo=111",
+            found[0].link,
+        )
+
+    def test_msit_mismatched_rows_are_not_guessed(self):
+        board = app.OfficialBoard(
+            "과학기술정보통신부",
+            "훈령·예규·고시",
+            "https://www.msit.go.kr/bbs/list.do?sCode=user&mPid=103&mId=108",
+            kind="msit",
+        )
+        markup = '<input name="bbsSeqNo" id="bbsSeqNo" value="83"/><a onclick="fn_detail(1);"></a>'
+
+        self.assertEqual([], app.parse_msit_board(markup, board))
+
+    def test_session_id_is_removed_from_links(self):
+        board = app.OfficialBoard("행정안전부", "고시", "https://www.mois.go.kr/frt/list.do")
+        markup = (
+            '<tr><td><a href="/frt/a.do;jsessionid=ABC.node40?bbsId=1&amp;nttId=2">'
+            "개인정보 지침</a></td><td>2026.11.03.</td></tr>"
+        )
+
+        found = app.parse_official_board(markup, board)
+
+        self.assertEqual("https://www.mois.go.kr/frt/a.do?bbsId=1&nttId=2", found[0].link)
+
+    def test_topical_board_keeps_only_security_related_titles(self):
+        board = app.OfficialBoard(
+            "행정안전부", "고시", "https://www.mois.go.kr/frt/list.do", topical_only=True
+        )
+        markup = (
+            '<tr><td><a href="/a">지방우대지수 운영 규정</a></td><td>2026.11.03.</td></tr>'
+            '<tr><td><a href="/b">개인정보 보호 지침 개정</a></td><td>2026.11.03.</td></tr>'
+        )
+
+        with mock.patch.object(app, "fetch_bytes", return_value=markup.encode("utf-8")):
+            found = app.fetch_official_board(board, timeout=1)
+
+        self.assertEqual(["개인정보 보호 지침 개정"], [a.title for a in found])
 
     def test_date_only_publication_is_shown_without_a_made_up_time(self):
         self.assertEqual(

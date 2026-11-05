@@ -326,7 +326,9 @@ def normalize_news_link(value: str) -> str:
     return value
 
 
-def fetch_with_curl(url: str, timeout: float) -> bytes:
+def fetch_with_curl(
+    url: str, timeout: float, data: bytes | None = None, content_type: str | None = None
+) -> bytes:
     """Python 인증서 저장소에 문제가 있을 때 시스템 curl로 데이터를 받는다."""
     command = ["curl"]
     if sys.platform == "win32":
@@ -342,13 +344,16 @@ def fetch_with_curl(url: str, timeout: float) -> bytes:
             str(max(1, int(timeout))),
             "--user-agent",
             USER_AGENT,
-            url,
         ]
     )
+    if data is not None:
+        command.extend(["--header", f"Content-Type: {content_type}", "--data-binary", "@-"])
+    command.append(url)
     try:
         completed = subprocess.run(
             command,
             check=True,
+            input=data,
             capture_output=True,
             timeout=timeout + 2,
         )
@@ -475,9 +480,14 @@ def post_kakao_form(
     return result
 
 
-def fetch_bytes(url: str, timeout: float) -> bytes:
-    """URL의 본문을 받는다. 인증서 문제가 있으면 시스템 curl로 다시 시도한다."""
-    request = Request(url, headers={"User-Agent": USER_AGENT})
+def fetch_bytes(
+    url: str, timeout: float, data: bytes | None = None, content_type: str | None = None
+) -> bytes:
+    """URL의 본문을 받는다. data가 있으면 POST한다. 인증서 문제가 있으면 curl로 다시 시도한다."""
+    headers = {"User-Agent": USER_AGENT}
+    if data is not None:
+        headers["Content-Type"] = content_type or "application/json"
+    request = Request(url, data=data, headers=headers)
 
     raw_data: bytes
     try:
@@ -488,7 +498,7 @@ def fetch_bytes(url: str, timeout: float) -> bytes:
     except URLError as exc:
         reason = getattr(exc, "reason", exc)
         if isinstance(reason, ssl.SSLError):
-            raw_data = fetch_with_curl(url, timeout)
+            raw_data = fetch_with_curl(url, timeout, data, headers.get("Content-Type"))
         else:
             raise RuntimeError(f"뉴스 서버에 연결할 수 없습니다: {reason}") from exc
     except TimeoutError as exc:
@@ -1387,6 +1397,11 @@ class OfficialBoard:
     agency: str
     name: str
     url: str
+    # 게시판 화면 방식. table: 서버가 그린 목록 표, msit: 목록이 스크립트에 박힌
+    # 과기정통부 게시판, fsec: 금융보안원의 JSON 목록 API(url의 마지막 경로가 menuNo).
+    kind: str = "table"
+    # 보안과 무관한 글이 많은 종합 게시판은 제목에 주제어가 있는 글만 남긴다.
+    topical_only: bool = False
 
 
 # 뉴스 검색이 아니라 기관 게시판을 직접 읽는다. 목록 표(<tr>)에 제목 링크와
@@ -1404,6 +1419,34 @@ OFFICIAL_BOARDS = (
     ),
     OfficialBoard("한국인터넷진흥원(KISA)", "가이드라인", "https://www.kisa.or.kr/2060207"),
     OfficialBoard("한국인터넷진흥원(KISA)", "안내서", "https://www.kisa.or.kr/2060307"),
+    OfficialBoard(
+        "행정안전부",
+        "훈령·예규·고시",
+        "https://www.mois.go.kr/frt/bbs/type001/commonSelectBoardList.do?bbsId=BBSMSTR_000000000016",
+        topical_only=True,
+    ),
+    OfficialBoard(
+        "행정안전부",
+        "정보화 표준·지침",
+        "https://www.mois.go.kr/frt/bbs/type001/commonSelectBoardList.do?bbsId=BBSMSTR_000000000045",
+        topical_only=True,
+    ),
+    OfficialBoard(
+        "과학기술정보통신부",
+        "훈령·예규·고시",
+        "https://www.msit.go.kr/bbs/list.do?sCode=user&mPid=103&mId=108",
+        kind="msit",
+        topical_only=True,
+    ),
+    OfficialBoard(
+        "과학기술정보통신부",
+        "입법·행정예고",
+        "https://www.msit.go.kr/bbs/list.do?sCode=user&mPid=103&mId=109",
+        kind="msit",
+        topical_only=True,
+    ),
+    OfficialBoard("금융보안원", "가이드", "https://www.fsec.or.kr/bbs/222", kind="fsec"),
+    OfficialBoard("금융보안원", "금융보안표준", "https://www.fsec.or.kr/bbs/250", kind="fsec"),
 )
 # 게시판은 날짜만 알려주고 올라오는 빈도도 낮다. 보낸 이력으로 중복을 막으므로
 # 뉴스보다 넉넉한 창을 쓴다.
@@ -1414,8 +1457,23 @@ OFFICIAL_LINK_RE = re.compile(
 )
 OFFICIAL_DATE_RE = re.compile(r"(?<!\d)(20\d{2})[-.](\d{2})[-.](\d{2})(?!\d)")
 OFFICIAL_NEW_BADGE_RE = re.compile(r"\s+N$")
+SESSION_ID_RE = re.compile(r";jsessionid=[^?&#]*", re.IGNORECASE)
+# 과기정통부 목록은 표 대신 스크립트로 채워진다. 행 순서대로 글번호(onclick), 제목
+# (unescape('...')), 날짜($('#td_'+'REG_DT'+'_행').html('...'))가 따로 나온다.
+MSIT_ID_RE = re.compile(r'onclick="fn_detail\((\d+)\);"')
+MSIT_TITLE_RE = re.compile(r"unescape\('((?:[^'\\]|\\.)*)'\);\s*sHtml\+=\s*newHtml")
+MSIT_DATE_RE = r"\$\('#td_'\+'REG_DT'\+'_%d'\)\.html\('([^']+)'\)"
+MSIT_BBS_SEQ_RE = re.compile(r'name="bbsSeqNo"\s+id="bbsSeqNo"\s+value="(\d+)"')
+MSIT_US_DATE_FORMAT = "%b %d, %Y"
 # 이 표현이 제목에 있으면 기존 문서의 개정·새 해설서일 가능성이 커 중요도를 높인다.
 OFFICIAL_IMPORTANT_TERMS = ("해설서", "안내서", "가이드라인", "고시", "개정")
+# topical_only 게시판에서 개인정보·정보보안과 관련 있는 글을 가려내는 제목 표현.
+OFFICIAL_TOPIC_TERMS = (
+    "개인정보", "정보보호", "정보보안", "보안", "사이버", "정보통신망", "정보시스템",
+    "가명", "익명", "암호", "인증", "해킹", "침해", "클라우드", "인공지능", "ai",
+    "데이터", "전자정부", "정보화", "신용정보", "전자서명", "디지털", "마이데이터",
+    "위치정보", "정보공개", "전자문서",
+)
 
 
 def parse_official_board(markup: str, board: OfficialBoard) -> list[Article]:
@@ -1444,7 +1502,9 @@ def parse_official_board(markup: str, board: OfficialBoard) -> list[Article]:
         articles.append(
             Article(
                 title=title,
-                link=urljoin(board.url, html.unescape(link_match.group(1))),
+                link=SESSION_ID_RE.sub(
+                    "", urljoin(board.url, html.unescape(link_match.group(1)))
+                ),
                 source=board.agency,
                 published=published,
                 description="",
@@ -1454,16 +1514,122 @@ def parse_official_board(markup: str, board: OfficialBoard) -> list[Article]:
     return articles
 
 
+def parse_msit_board(markup: str, board: OfficialBoard) -> list[Article]:
+    """과기정통부 게시판은 목록이 스크립트 안에 있어 그 구문에서 직접 뽑는다."""
+    query = parse_qs(urlparse(board.url).query)
+    sequence = MSIT_BBS_SEQ_RE.search(markup)
+    if not sequence or not query.get("mId") or not query.get("mPid"):
+        return []
+    numbers = MSIT_ID_RE.findall(markup)
+    titles = MSIT_TITLE_RE.findall(markup)
+    if len(numbers) != len(titles):
+        # 행마다 짝이 맞지 않으면 화면 구조가 바뀐 것이므로 엉뚱한 제목을 붙이지 않는다.
+        return []
+    articles: list[Article] = []
+    for row, (number, title) in enumerate(zip(numbers, titles)):
+        # 같은 행 날짜가 여러 번 나오는데 마지막이 화면에 보이는 게시일이다.
+        dates = re.findall(MSIT_DATE_RE % row, markup)
+        if not dates:
+            continue
+        raw_date = dates[-1]
+        match = OFFICIAL_DATE_RE.search(raw_date)
+        try:
+            if match:
+                published = datetime(*(int(part) for part in match.groups()), tzinfo=KST)
+            else:
+                published = datetime.strptime(raw_date, MSIT_US_DATE_FORMAT).replace(
+                    tzinfo=KST
+                )
+        except ValueError:
+            continue
+        detail = urlencode(
+            {
+                "sCode": "user",
+                "mId": query["mId"][0],
+                "mPid": query["mPid"][0],
+                "bbsSeqNo": sequence.group(1),
+                "nttSeqNo": number,
+            }
+        )
+        articles.append(
+            Article(
+                title=clean_text(title),
+                link=urljoin(board.url, f"/bbs/view.do?{detail}"),
+                source=board.agency,
+                published=published,
+                description="",
+                keywords=(board.name,),
+            )
+        )
+    return articles
+
+
+def parse_fsec_board(payload: str, board: OfficialBoard) -> list[Article]:
+    """금융보안원 목록 API 응답(JSON)에서 글을 뽑는다."""
+    try:
+        entries = json.loads(payload).get("resultData") or []
+    except (ValueError, AttributeError):
+        return []
+    menu = board.url.rstrip("/").rsplit("/", 1)[-1]
+    articles: list[Article] = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        match = OFFICIAL_DATE_RE.search(str(entry.get("regDate", "")))
+        title = clean_text(str(entry.get("title", "")))
+        if not match or not title or not entry.get("bbsNo"):
+            continue
+        articles.append(
+            Article(
+                title=title,
+                link=urljoin(board.url, f"/bbs/detail?menuNo={menu}&bbsNo={entry['bbsNo']}"),
+                source=board.agency,
+                published=datetime(*(int(part) for part in match.groups()), tzinfo=KST),
+                description="",
+                keywords=(board.name,),
+            )
+        )
+    return articles
+
+
 def fetch_official_board(board: OfficialBoard, timeout: float) -> list[Article]:
-    raw = fetch_bytes(board.url, timeout)
+    if board.kind == "fsec":
+        menu = board.url.rstrip("/").rsplit("/", 1)[-1]
+        body = json.dumps(
+            {
+                "menuNo": int(menu),
+                "pagingSearchDto": {
+                    "page": 1,
+                    "pageSize": 20,
+                    "searchContents": "",
+                    "searchType": "",
+                },
+            }
+        ).encode("utf-8")
+        raw = fetch_bytes(
+            urljoin(board.url, "/bbs/list"), timeout, body, "application/json; charset=UTF-8"
+        )
+    else:
+        raw = fetch_bytes(board.url, timeout)
     try:
         markup = raw.decode("utf-8")
     except UnicodeDecodeError:
         markup = raw.decode("cp949", errors="replace")
-    articles = parse_official_board(markup, board)
+    if board.kind == "fsec":
+        articles = parse_fsec_board(markup, board)
+    elif board.kind == "msit":
+        articles = parse_msit_board(markup, board)
+    else:
+        articles = parse_official_board(markup, board)
     if not articles:
         # 화면 구조가 바뀌면 조용히 0건이 되므로 읽지 못한 것으로 알린다.
         raise RuntimeError(f"{board.agency} {board.name} 게시판에서 글을 읽지 못했습니다.")
+    if board.topical_only:
+        articles = [
+            article
+            for article in articles
+            if any(term in article.title.casefold() for term in OFFICIAL_TOPIC_TERMS)
+        ]
     return articles
 
 
