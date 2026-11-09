@@ -1293,5 +1293,81 @@ class OfficialDocumentTests(unittest.TestCase):
         self.assertNotIn(app.SECTION_OFFICIAL, app.classify_sections(story))
 
 
+class LinkVerificationTests(unittest.TestCase):
+    def setUp(self):
+        self.now = datetime(2026, 9, 3, 1, 0, tzinfo=timezone.utc)
+        filler = "본문 문장입니다. " * 40
+        self.pages = {
+            "https://sec.example/a": f"<title>미래에셋증권 해킹</title><p>미래에셋증권 고객 계좌번호 해킹 유출 사고. {filler}</p>",
+            "https://life.example/b": f"<title>미래에셋생명 해킹</title><p>미래에셋생명 고객정보 해킹 유출 사고. {filler}</p>",
+            "https://same-title.example/c": f"<title>미래에셋증권 해킹 유출</title><p>전혀 다른 날씨 소식. {filler}</p>",
+        }
+        self.sec = article("미래에셋증권 고객 계좌번호 해킹 유출", "https://sec.example/a", self.now)
+
+    def fake_fetch(self, url, timeout, data=None, content_type=None):
+        if url not in self.pages:
+            raise RuntimeError("열 수 없음")
+        return self.pages[url].encode("utf-8")
+
+    def check(self, target):
+        with mock.patch.object(app, "fetch_bytes", self.fake_fetch):
+            return app.check_article_link(target, 5)
+
+    def test_matching_body_is_accepted(self):
+        self.assertEqual(app.LINK_OK, self.check(self.sec)[0])
+
+    def test_similar_company_with_different_body_is_rejected(self):
+        wrong = replace_link(self.sec, "https://life.example/b")
+        self.assertEqual(app.LINK_MISMATCH, self.check(wrong)[0])
+
+    def test_matching_page_title_cannot_hide_a_different_body(self):
+        wrong = replace_link(self.sec, "https://same-title.example/c")
+        self.assertEqual(app.LINK_MISMATCH, self.check(wrong)[0])
+
+    def test_unreachable_link_is_unverifiable_not_wrong(self):
+        gone = replace_link(self.sec, "https://gone.example/z")
+        self.assertEqual(app.LINK_UNVERIFIABLE, self.check(gone)[0])
+
+    def test_google_link_is_resolved_before_checking(self):
+        relay = replace_link(self.sec, "https://news.google.com/rss/articles/TOKEN?oc=5")
+        with mock.patch.object(app, "fetch_bytes", self.fake_fetch), mock.patch.object(
+            app, "resolve_google_link", return_value="https://sec.example/a"
+        ):
+            verdict, url = app.check_article_link(relay, 5)
+        self.assertEqual((app.LINK_OK, "https://sec.example/a"), (verdict, url))
+
+    def test_story_switches_to_the_article_whose_link_matches(self):
+        wrong = replace_link(self.sec, "https://life.example/b")
+        story = app.Story("", "미래에셋증권 해킹", "", 4, wrong, (self.sec,))
+        with mock.patch.object(app, "fetch_bytes", self.fake_fetch):
+            fixed, verdict = app.verify_story_links(story, 5)
+        self.assertEqual(app.LINK_OK, verdict)
+        self.assertEqual("https://sec.example/a", fixed.representative.link)
+        self.assertNotIn(wrong, fixed.articles)
+
+    def test_story_is_dropped_when_every_link_is_wrong(self):
+        wrong = replace_link(self.sec, "https://life.example/b")
+        story = app.Story("", "미래에셋증권 해킹", "", 4, wrong)
+        with mock.patch.object(app, "fetch_bytes", self.fake_fetch):
+            fixed, verdict = app.verify_story_links(story, 5)
+        self.assertIsNone(fixed)
+        self.assertEqual(app.LINK_MISMATCH, verdict)
+
+    def test_official_documents_are_not_fetched(self):
+        story = app.Story("", "공식", "", 3, self.sec, preset_sections=(app.SECTION_OFFICIAL,))
+        with mock.patch.object(app, "fetch_bytes", side_effect=AssertionError):
+            fixed, _ = app.verify_story_links(story, 5)
+        self.assertIs(story, fixed)
+
+    def test_notice_reports_dropped_and_unverified(self):
+        lines = app.notice_lines(app.RunStats(dropped_links=2, unverified_links=1))
+        self.assertTrue(any("2건은 뺐습니다" in line for line in lines))
+        self.assertTrue(any("1건은 원문을 열지 못해" in line for line in lines))
+
+
+def replace_link(target: app.Article, link: str) -> app.Article:
+    return app.Article(target.title, link, target.source, target.published, target.description, target.keywords)
+
+
 if __name__ == "__main__":
     unittest.main()

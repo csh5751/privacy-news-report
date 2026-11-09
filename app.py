@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import html
+import http.client
 import json
 import math
 import os
@@ -14,6 +15,7 @@ import subprocess
 import sys
 import time
 import traceback
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from difflib import SequenceMatcher
@@ -22,7 +24,7 @@ from io import TextIOBase
 from pathlib import Path
 from typing import Callable, Iterable, TypeVar
 from urllib.error import HTTPError, URLError
-from urllib.parse import parse_qs, urlencode, urljoin, urlparse, urlsplit, urlunsplit
+from urllib.parse import parse_qs, quote, urlencode, urljoin, urlparse, urlsplit, urlunsplit
 from urllib.request import Request, urlopen
 from xml.etree import ElementTree
 
@@ -164,6 +166,9 @@ class RunStats:
     # 정부·유관기관 게시판에서 새로 찾은 공식 문서 수와 읽지 못한 게시판 수.
     official: int = 0
     failed_official: int = 0
+    # 링크를 열어 보니 제목과 다른 내용이라 뺀 사건 수와, 열지 못해 확인하지 못한 사건 수.
+    dropped_links: int = 0
+    unverified_links: int = 0
 
 
 @dataclass(frozen=True)
@@ -1918,6 +1923,14 @@ def notice_lines(stats: RunStats) -> list[str]:
         lines.append(f"주제 {stats.failed_keywords}개는 수집에 실패했습니다.")
     if stats.failed_official:
         lines.append(f"공식 문서 게시판 {stats.failed_official}곳은 읽지 못했습니다.")
+    if stats.dropped_links:
+        lines.append(
+            f"링크가 제목과 다른 내용으로 연결되는 {stats.dropped_links}건은 뺐습니다."
+        )
+    if stats.unverified_links:
+        lines.append(
+            f"{stats.unverified_links}건은 원문을 열지 못해 링크를 확인하지 못했습니다."
+        )
     return lines
 
 
@@ -2321,6 +2334,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Claude 큐레이션을 건너뛰고 휴리스틱으로만 정리합니다.",
     )
     parser.add_argument(
+        "--no-verify-links",
+        action="store_true",
+        help="기사 링크를 열어 제목·본문과 맞는지 확인하는 단계를 건너뜁니다.",
+    )
+    parser.add_argument(
         "--site",
         metavar="PATH",
         help="같은 실행 결과로 HTML 보고서도 만듭니다. 예: site/index.html",
@@ -2348,6 +2366,184 @@ def build_parser() -> argparse.ArgumentParser:
         help="카카오톡 전송을 생략합니다(기본 동작이며 이전 명령과의 호환용).",
     )
     return parser
+
+
+LINK_OK = "ok"
+LINK_MISMATCH = "mismatch"
+LINK_UNVERIFIABLE = "unverifiable"
+# 기사 제목의 핵심 단어 가운데 링크된 페이지에 실제로 나오는 비율의 하한.
+# 제목만 닮은 페이지를 거르려고 페이지 제목이 아니라 본문까지 찾아본다.
+LINK_MIN_MATCH = 0.5
+# 어느 사건 기사에나 나오는 주제어. 이 단어들이 겹친다고 같은 기사로 볼 수 없다.
+# ("해킹·유출·고객"만 겹치면 미래에셋증권 기사와 미래에셋생명 기사가 구분되지 않는다.)
+LINK_GENERIC_TERMS = frozenset({
+    "해킹", "유출", "고객", "고객정보", "개인정보", "정보", "사고", "침해", "침해사고",
+    "보안", "사이버", "공격", "피해", "발생", "확인", "조사", "점검", "논란", "관련",
+    "대응", "강화", "한국", "정부", "기업", "서비스", "시스템", "보험", "금융",
+})
+# 이보다 짧으면 본문을 읽지 못한 것(유료 벽·자바스크립트 렌더링)이라 판단을 보류한다.
+LINK_MIN_TEXT = 200
+LINK_MAX_TEXT = 40000
+LINK_MAX_TRIES = 3
+LINK_WORKERS = 6
+GOOGLE_BATCH_URL = "https://news.google.com/_/DotsSplashUi/data/batchexecute"
+NON_TEXT_BLOCK_RE = re.compile(r"<(script|style|noscript)\b.*?</\1\s*>", re.S | re.I)
+HEAD_TITLE_RE = re.compile(r"<title[^>]*>(.*?)</title>", re.S | re.I)
+
+
+def is_google_news_link(link: str) -> bool:
+    parts = urlparse(link)
+    return (parts.hostname or "").casefold() == "news.google.com" and "/articles/" in parts.path
+
+
+def resolve_google_link(link: str, timeout: float) -> str:
+    """Google News 중계 링크가 가리키는 실제 기사 URL을 알아낸다.
+
+    중계 링크는 브라우저의 자바스크립트로만 원문에 도달하는 불투명한 토큰이라
+    서버에서는 풀지 않으면 어떤 기사인지 확인할 수 없다.
+    """
+    article_id = urlparse(link).path.rsplit("/", 1)[-1]
+    page = fetch_bytes(
+        f"https://news.google.com/rss/articles/{article_id}?hl=ko&gl=KR&ceid=KR:ko",
+        timeout,
+    ).decode("utf-8", errors="replace")
+    signature = re.search(r'data-n-a-sg="([^"]+)"', page)
+    stamp = re.search(r'data-n-a-ts="(\d+)"', page)
+    if not signature or not stamp:
+        raise RuntimeError("Google News 링크 정보를 찾지 못했습니다.")
+    inner = json.dumps(
+        [
+            "garturlreq",
+            [["X", "X", ["X", "X"], None, None, 1, 1, "KR:ko", None, 1, None, None,
+              None, None, None, 0, 1], "X", "X", 1, [1, 1, 1], 1, 1, None, 0, 0, None, 0],
+            article_id,
+            int(stamp.group(1)),
+            signature.group(1),
+        ],
+        separators=(",", ":"),
+    )
+    request = json.dumps([[["Fbv4je", inner, None, "generic"]]], separators=(",", ":"))
+    reply = fetch_bytes(
+        GOOGLE_BATCH_URL,
+        timeout,
+        ("f.req=" + quote(request)).encode("utf-8"),
+        "application/x-www-form-urlencoded;charset=UTF-8",
+    ).decode("utf-8", errors="replace")
+    for line in reply.splitlines():
+        if not line.startswith("[["):
+            continue
+        try:
+            rows = json.loads(line)
+            for row in rows:
+                if row[0] == "wrb.fr" and row[2]:
+                    result = json.loads(row[2])
+                    if result[0] == "garturlres" and str(result[1]).startswith("http"):
+                        return str(result[1])
+        except (ValueError, IndexError, TypeError):
+            continue
+    raise RuntimeError("Google News 링크를 원문 URL로 풀지 못했습니다.")
+
+
+def decode_page(raw: bytes) -> str:
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return raw.decode("cp949", errors="replace")
+
+
+def page_text(markup: str) -> str:
+    """페이지 본문 글자만 뽑는다. 제목은 일부러 뺀다.
+
+    제목만 같고 내용이 다른 페이지(오래된 기사, 다른 사건 기사)를 거르려면
+    본문에서 확인해야 한다.
+    """
+    body = HEAD_TITLE_RE.sub(" ", NON_TEXT_BLOCK_RE.sub(" ", markup))
+    return clean_text(body)[:LINK_MAX_TEXT]
+
+
+def judge_page(article: Article, text: str) -> str:
+    """페이지 글자가 기사 제목이 말하는 내용을 담고 있는지 판단한다."""
+    # 제목만 맞고 본문이 다른 페이지를 거르기 위해, 제목 단어가 본문에 있는지 본다.
+    # "미래에셋증권"과 "미래에셋생명"처럼 한 글자 차이로 다른 사건도 걸러진다.
+    if len(text) < LINK_MIN_TEXT:
+        return LINK_UNVERIFIABLE
+    tokens = story_tokens(article.title) - LINK_GENERIC_TERMS
+    # 사건을 구분할 단어가 없는 제목은 본문과 대조해도 근거가 되지 않는다.
+    if not tokens:
+        return LINK_UNVERIFIABLE
+    haystack = text.casefold()
+    found = sum(1 for token in tokens if token in haystack)
+    return LINK_OK if found / len(tokens) >= LINK_MIN_MATCH else LINK_MISMATCH
+
+
+def check_article_link(article: Article, timeout: float) -> tuple[str, str]:
+    """기사 링크를 실제로 열어 제목과 맞는지 확인한다. (판정, 실제 URL)을 돌려준다."""
+    url = article.link
+    try:
+        if is_google_news_link(url):
+            url = resolve_google_link(url, timeout)
+        if (urlparse(url).hostname or "").casefold().endswith("google.com"):
+            return LINK_UNVERIFIABLE, article.link
+        text = page_text(decode_page(fetch_bytes(url, timeout)))
+    except (RuntimeError, ValueError, OSError, http.client.HTTPException):
+        # 열지 못한 것은 틀렸다는 증거가 아니다. 그대로 두고 확인 불가로 센다.
+        return LINK_UNVERIFIABLE, article.link
+    return judge_page(article, text), url
+
+
+def verify_story_links(
+    story: Story, timeout: float
+) -> tuple[Story | None, str]:
+    """대표 기사 링크가 제목과 맞는지 확인하고, 틀렸으면 맞는 기사로 바꾼다.
+
+    맞는 기사가 있으면 그것을 대표로 삼고, 확인만 못 했으면 그대로 둔다. 모든
+    기사가 다른 내용으로 연결되면 사건 자체를 뺀다.
+    """
+    if story.preset_sections == (SECTION_OFFICIAL,):
+        return story, LINK_OK
+    checked = story.articles[:LINK_MAX_TRIES]
+    untouched = story.articles[LINK_MAX_TRIES:]
+    verified: list[Article] = []
+    unverified: list[Article] = []
+    for article in checked:
+        verdict, url = check_article_link(article, timeout)
+        if verdict == LINK_OK:
+            verified.append(replace(article, link=url))
+            break
+        if verdict == LINK_UNVERIFIABLE:
+            unverified.append(article)
+        else:
+            print(
+                f"[링크 검증] 제목과 본문이 맞지 않아 제외: {article.title} ({article.source})",
+                file=sys.stderr,
+            )
+    pool = [*verified, *unverified]
+    if not pool:
+        return None, LINK_MISMATCH
+    rest = (*pool[1:], *untouched)
+    return (
+        replace(story, representative=pool[0], related=tuple(rest)),
+        LINK_OK if verified else LINK_UNVERIFIABLE,
+    )
+
+
+def verify_sections(
+    sections: dict[str, list[Story]], timeout: float
+) -> tuple[dict[str, list[Story]], int, int]:
+    """보고서에 실을 사건의 링크를 모두 확인한다. (구획, 제외한 사건 수, 확인 못한 사건 수)."""
+    entries = [(name, story) for name, stories in sections.items() for story in stories]
+    with ThreadPoolExecutor(max_workers=LINK_WORKERS) as pool:
+        results = list(pool.map(lambda entry: verify_story_links(entry[1], timeout), entries))
+    verified: dict[str, list[Story]] = {name: [] for name in sections}
+    dropped = unverified = 0
+    for (name, _), (story, verdict) in zip(entries, results):
+        if story is None:
+            dropped += 1
+            continue
+        if verdict == LINK_UNVERIFIABLE:
+            unverified += 1
+        verified[name].append(story)
+    return verified, dropped, unverified
 
 
 def collect_candidates(
@@ -2383,6 +2579,7 @@ def build_report(
     api_key: str | None,
     excluded_keys: set[str] | None = None,
     feedback_api_url: str | None = None,
+    verify_links: bool = True,
 ) -> Report:
     """후보를 모아 큐레이션한 구획과 처리 내역을 만든다."""
     pool, failures = collect_candidates(keywords, timeout, window_hours)
@@ -2412,6 +2609,12 @@ def build_report(
     stories = apply_feedback(stories, signals)
     sections = group_sections(stories)
     sections = select_balanced_stories(sections, limit)
+    dropped_links = unverified_links = 0
+    if verify_links:
+        sections, dropped_links, unverified_links = verify_sections(sections, timeout)
+        print(
+            f"[링크 검증] 제외 {dropped_links}건 · 확인 못함 {unverified_links}건"
+        )
     if signals:
         print(f"[피드백] 누적 평가 신호 {len(signals)}개를 선별 순위에 반영했습니다.")
     filled = sum(1 for entries in sections.values() if entries)
@@ -2437,6 +2640,8 @@ def build_report(
         failed_keywords=failures,
         official=len(new_official),
         failed_official=official_failures,
+        dropped_links=dropped_links,
+        unverified_links=unverified_links,
     )
     print(f"[정리] 구획 {filled}/{len(sections)}개 · 사건 {stats.stories}건")
     if clustered:
@@ -2484,12 +2689,14 @@ def run_news_cycle(
     kakao_config: KakaoConfig | None,
     api_key: str | None,
     site_output: str | None = None,
+    verify_links: bool = True,
 ) -> int:
     """뉴스 수집·큐레이션과 콘솔 출력 및 Teams 전송을 한 차례 수행한다."""
     print(f"{', '.join(keywords)} 주제의 새 뉴스를 가져오는 중입니다...")
     history = load_sent_history()
     report = build_report(
-        keywords, limit, timeout, window_hours, api_key, set(history), get_feedback_api_url()
+        keywords, limit, timeout, window_hours, api_key, set(history), get_feedback_api_url(),
+        verify_links,
     )
     sections, stats = report.sections, report.stats
     failures = stats.failed_keywords
@@ -2615,6 +2822,7 @@ def main(argv: list[str] | None = None) -> int:
             kakao_config,
             api_key,
             args.site,
+            not args.no_verify_links,
         )
         if args.interval == 0:
             return result
