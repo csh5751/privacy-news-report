@@ -2546,6 +2546,15 @@ def verify_sections(
     return verified, dropped, unverified
 
 
+def order_revisited(official: list[Story], news: list[Story]) -> list[Story]:
+    """이미 안내한 공식 문서와 뉴스 사건을 화제성 순으로 섞는다.
+
+    공식 문서를 앞에 그냥 붙이면 자리 제한(REVISITED_LIMIT)에 걸려
+    보도량이 큰 사건이 밀려난다. 같은 기준으로 정렬한 뒤 자른다.
+    """
+    return sorted([*official, *news], key=story_heat, reverse=True)
+
+
 def collect_candidates(
     keywords: list[str],
     timeout: float,
@@ -2626,7 +2635,7 @@ def build_report(
     clustered = curate_heuristically(seen, len(seen)) if seen else []
     # 이미 보낸 공식 문서도 시간 창 안이면 함께 적는다. 안 그러면 보낸 직후부터
     # 보고서의 공식 문서 구획이 비어 "올라온 문서가 없다"는 오해를 준다.
-    clustered = official_sent + clustered
+    clustered = order_revisited(official_sent, clustered)
     revisited = clustered[:REVISITED_LIMIT]
 
     stats = RunStats(

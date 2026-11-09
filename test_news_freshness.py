@@ -762,6 +762,20 @@ class RevisitedTests(unittest.TestCase):
             related=(article("이미 안내 2", "https://a.test/old2", self.now, "중앙일보"),),
         )
 
+    def test_revisited_order_mixes_official_documents_by_heat(self):
+        big = app.Story("", "큰 사건", "", 5, article("큰", "https://a.test/big", self.now, "연합뉴스"),
+                        tuple(article(f"큰 {i}", f"https://a.test/big{i}", self.now) for i in range(5)))
+        official = [
+            app.Story("", f"공식 {i}", "", 3, article(f"공식 {i}", f"https://gov.test/{i}", self.now),
+                      preset_sections=(app.SECTION_OFFICIAL,))
+            for i in range(10)
+        ]
+
+        ordered = app.order_revisited(official, [big])
+
+        self.assertIs(big, ordered[0])
+        self.assertIn(big, ordered[: app.REVISITED_LIMIT])
+
     def test_partition_keeps_the_already_reported_articles(self):
         fresh = article("새 기사", "https://a.test/1", self.now)
         seen = article("보낸 기사", "https://a.test/2", self.now)
