@@ -1307,6 +1307,147 @@ class OfficialDocumentTests(unittest.TestCase):
         self.assertNotIn(app.SECTION_OFFICIAL, app.classify_sections(story))
 
 
+class LawApiTests(unittest.TestCase):
+    LIST = {
+        "PrecSearch": {
+            "prec": [
+                {"판례일련번호": "111", "사건명": "손해배상(기)", "사건번호": "2024다12345",
+                 "선고일자": "20261028", "법원명": "대법원", "판결유형": "판결"},
+                {"판례일련번호": "222", "사건명": "상속세부과처분취소", "사건번호": "2024두999",
+                 "선고일자": "20261027", "법원명": "대법원", "판결유형": "판결"},
+            ]
+        }
+    }
+    DETAIL = {
+        "111": {"PrecService": {
+            "사건명": "손해배상(기)", "사건번호": "2024다12345", "선고일자": "20261028",
+            "법원명": "대법원",
+            "판시사항": "개인정보 유출 사고에서 개인정보처리자의 안전조치의무 위반 여부",
+            "판결요지": "개인정보처리자는 해킹에 대비한 접근통제 조치를 해야 한다.",
+        }},
+        "222": {"PrecService": {
+            "사건명": "상속세부과처분취소", "사건번호": "2024두999", "선고일자": "20261027",
+            "법원명": "대법원", "판시사항": "상속재산 평가", "판결요지": "세법 해석",
+        }},
+    }
+
+    def fake_fetch(self, url, timeout, data=None, content_type=None):
+        if "lawSearch.do" in url:
+            return json.dumps(self.LIST, ensure_ascii=False).encode("utf-8")
+        seq = url.split("ID=")[1].split("&")[0]
+        return json.dumps(self.DETAIL[seq], ensure_ascii=False).encode("utf-8")
+
+    def test_only_privacy_judgments_are_kept_with_a_public_link(self):
+        with mock.patch.object(app, "fetch_bytes", self.fake_fetch):
+            found = app.fetch_law_precedents("SECRETKEY", 5)
+
+        self.assertEqual(1, len(found))
+        self.assertIn("2024다12345", found[0].title)
+        self.assertEqual("https://www.law.go.kr/LSW/precInfoP.do?precSeq=111", found[0].link)
+        self.assertNotIn("SECRETKEY", found[0].link)
+        self.assertIn("안전조치의무", found[0].description)
+
+    def test_rejected_key_is_reported_with_a_hint_about_the_allowed_ip(self):
+        denied = json.dumps({"result": "사용자 정보 검증에 실패하였습니다.", "msg": "IP 등록"}).encode()
+        with mock.patch.object(app, "fetch_bytes", lambda *a, **k: denied):
+            with self.assertRaises(RuntimeError) as caught:
+                app.fetch_law_precedents("SECRETKEY", 5)
+        self.assertIn("허용 IP", str(caught.exception))
+        self.assertNotIn("SECRETKEY", str(caught.exception))
+
+    def test_missing_key_skips_the_lookup_without_an_error(self):
+        with mock.patch.dict("os.environ", {}, clear=True), mock.patch.object(
+            app, "fetch_bytes", side_effect=AssertionError
+        ):
+            self.assertEqual(([], ""), app.collect_law_precedents(5))
+
+    def test_failure_reason_is_returned_for_the_notice(self):
+        with mock.patch.dict("os.environ", {"LAW_API_KEY": "K"}), mock.patch.object(
+            app, "fetch_law_precedents", side_effect=RuntimeError("거절")
+        ), mock.patch.object(app, "retry_operation", lambda name, fn, **k: fn()):
+            self.assertEqual(([], "거절"), app.collect_law_precedents(5))
+        self.assertTrue(any("거절" in line for line in app.notice_lines(app.RunStats(law_error="거절"))))
+
+    def test_judgment_links_are_not_page_checked(self):
+        story = app.Story(
+            "", "판결", "", 3,
+            article("판결", "https://www.law.go.kr/LSW/precInfoP.do?precSeq=1",
+                    datetime(2026, 11, 1, tzinfo=timezone.utc)),
+        )
+        with mock.patch.object(app, "fetch_bytes", side_effect=AssertionError):
+            fixed, verdict = app.verify_story_links(story, 5)
+        self.assertIs(story, fixed)
+        self.assertEqual(app.LINK_OK, verdict)
+
+
+class GithubOnlyTests(unittest.TestCase):
+    def test_collection_refuses_to_run_outside_github_actions(self):
+        with mock.patch.dict("os.environ", {}, clear=True), mock.patch.object(
+            app, "collect_candidates", side_effect=AssertionError("수집하면 안 됨")
+        ):
+            with self.assertRaises(SystemExit) as caught:
+                app.build_report(["키워드"], 5, 5.0, 30, None)
+        self.assertEqual(2, caught.exception.code)
+
+    def test_guard_passes_inside_github_actions(self):
+        with mock.patch.dict("os.environ", {"GITHUB_ACTIONS": "true"}):
+            app.require_github_actions()
+
+
+class PrecedentTests(unittest.TestCase):
+    def setUp(self):
+        self.now = datetime(2026, 11, 11, 3, 0, tzinfo=timezone.utc)
+
+    def news(self, title, link="https://a.test/1", days=1, source="연합뉴스"):
+        return article(title, link, self.now - timedelta(days=days), source)
+
+    def test_only_court_rulings_on_privacy_topics_count_as_precedents(self):
+        self.assertTrue(app.is_precedent_article(self.news("대법원, 개인정보 유출 기업 손해배상 책임 인정")))
+        self.assertTrue(app.is_precedent_article(self.news("법원 \"해킹 피해 고객에 위자료 지급\" 판결")))
+        self.assertFalse(app.is_precedent_article(self.news("개인정보위, 유출 기업에 과징금 부과")))
+        self.assertFalse(app.is_precedent_article(self.news("대법원, 상속세 판결 확정")))
+        self.assertFalse(app.is_precedent_article(self.news("개인정보 유출 판결 정리", source="네이버 블로그")))
+
+    def test_stories_are_placed_in_the_precedent_section(self):
+        found = [
+            self.news("대법원, 개인정보 유출 손해배상 판결", "https://a.test/1"),
+            self.news("대법원 개인정보 유출 손해배상 판결 확정", "https://b.test/2", source="KBS"),
+        ]
+        stories = app.precedent_stories(found, now=self.now)
+
+        self.assertEqual(1, len(stories))
+        self.assertEqual((app.SECTION_CASELAW,), stories[0].preset_sections)
+        self.assertEqual(2, len(stories[0].articles))
+        sections = app.group_sections(stories)
+        self.assertEqual(1, len(sections[app.SECTION_CASELAW]))
+
+    def test_sent_precedents_are_kept_apart_for_the_revisited_list(self):
+        sent = self.news("대법원, 개인정보 유출 손해배상 판결", "https://a.test/1")
+        excluded = app.article_keys(sent)
+
+        self.assertEqual([], app.precedent_stories([sent], excluded, now=self.now))
+        again = app.precedent_stories([sent], excluded, now=self.now, already_sent=True)
+        self.assertEqual(1, len(again))
+
+    def test_old_rulings_outside_the_window_are_ignored(self):
+        old = self.news("대법원, 개인정보 유출 손해배상 판결", days=30)
+        self.assertEqual([], app.precedent_stories([old], now=self.now))
+
+    def test_teams_message_has_the_precedent_section(self):
+        story = app.precedent_stories(
+            [self.news("대법원, 개인정보 유출 손해배상 판결")], now=self.now
+        )[0]
+        sections = app.group_sections([story])
+        message = app.build_teams_message(sections)["text"]
+
+        self.assertIn(app.SECTION_CASELAW, message)
+        self.assertIn("대법원, 개인정보 유출 손해배상 판결", message)
+
+    def test_notice_reports_failed_precedent_searches(self):
+        lines = app.notice_lines(app.RunStats(failed_precedents=2))
+        self.assertTrue(any("판례 검색어 2개" in line for line in lines))
+
+
 class LinkVerificationTests(unittest.TestCase):
     def setUp(self):
         self.now = datetime(2026, 9, 3, 1, 0, tzinfo=timezone.utc)

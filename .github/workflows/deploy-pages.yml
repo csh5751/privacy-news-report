@@ -51,6 +51,8 @@ jobs:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           ANTHROPIC_WORKSPACE_ID: ${{ secrets.ANTHROPIC_WORKSPACE_ID }}
           TEAMS_WEBHOOK_URL: ${{ secrets.TEAMS_WEBHOOK_URL }}
+          # 국가법령정보센터 판결문 조회용 인증키. 없으면 판결문 조회만 건너뛴다.
+          LAW_API_KEY: ${{ secrets.LAW_API_KEY }}
         run: |
           if [ "${{ github.event_name }}" = "push" ]; then
             python app.py --site site/index.html --no-teams -n 30

@@ -169,6 +169,10 @@ class RunStats:
     # 링크를 열어 보니 제목과 다른 내용이라 뺀 사건 수와, 열지 못해 확인하지 못한 사건 수.
     dropped_links: int = 0
     unverified_links: int = 0
+    # 판례 전용 검색어 가운데 수집에 실패한 수.
+    failed_precedents: int = 0
+    # 법령정보센터 판결문 조회가 실패한 사유. 비어 있으면 성공했거나 건너뛴 것이다.
+    law_error: str = ""
 
 
 @dataclass(frozen=True)
@@ -1700,9 +1704,209 @@ def official_stories(
 SECTION_LEAK = "개인정보 유출 사고"
 SECTION_BREACH = "사이버보안 침해사고"
 SECTION_OFFICIAL = "공식 문서·가이드"
+SECTION_CASELAW = "주요 판례"
 SECTION_TREND = "동향"
 # 표시 구획은 검색 키워드가 아니라 내용으로 정하는 고정된 네 가지뿐이다.
-REPORT_SECTIONS = [SECTION_LEAK, SECTION_BREACH, SECTION_OFFICIAL, SECTION_TREND]
+REPORT_SECTIONS = [
+    SECTION_LEAK, SECTION_BREACH, SECTION_OFFICIAL, SECTION_CASELAW, SECTION_TREND,
+]
+
+# 판례는 일반 뉴스 검색에 잘 안 잡히고 자주 나오지도 않아 전용 검색어와 긴 시간 창을 쓴다.
+# Claude 큐레이션의 구획 목록에는 넣지 않고(스키마가 세 구획으로 고정), 공식 문서처럼
+# 별도로 모아 이 구획에 곧바로 넣는다.
+PRECEDENT_KEYWORDS = [
+    "개인정보 유출 판결",
+    "개인정보보호법 대법원 판결",
+    "개인정보 손해배상 판결 법원",
+    "정보통신망법 판결 해킹",
+]
+PRECEDENT_WINDOW_HOURS = 24 * 7
+# 제목에 "법원의 판단"을 뜻하는 표현과 개인정보·보안 표현이 모두 있어야 판례 기사로 본다.
+PRECEDENT_RULING_TERMS = (
+    "판결", "판례", "선고", "대법", "법원", "재판부", "항소심", "상고심", "헌법재판소", "헌재",
+)
+PRECEDENT_TOPIC_TERMS = (
+    "개인정보", "정보통신망", "유출", "해킹", "정보주체", "주민등록번호", "프라이버시",
+    "정보보호", "개보법",
+)
+
+LAW_API_URL = "https://www.law.go.kr/DRF"
+# 법령정보센터에 판결이 올라오기까지 시차가 있어 선고일이 오래돼도 처음 보이면 알린다.
+# 한 번 알린 판례는 전송 이력으로 걸러진다.
+LAW_WINDOW_HOURS = 24 * 90
+LAW_QUERIES = ("개인정보 유출", "개인정보 보호법", "정보통신망법 개인정보")
+LAW_LIST_SIZE = 10
+LAW_DETAIL_LIMIT = 24
+LAW_PUBLIC_URL = "https://www.law.go.kr/LSW/precInfoP.do?precSeq={seq}"
+
+
+def get_law_api_key() -> str | None:
+    return os.environ.get("LAW_API_KEY") or None
+
+
+def law_request(
+    service: str, params: dict[str, str], api_key: str, timeout: float
+) -> dict[str, object]:
+    """국가법령정보센터 Open API를 호출해 JSON을 돌려준다."""
+    query = urlencode({"OC": api_key, "type": "JSON", **params})
+    raw = fetch_bytes(f"{LAW_API_URL}/{service}.do?{query}", timeout)
+    try:
+        payload = json.loads(decode_page(raw))
+    except ValueError as exc:
+        raise RuntimeError("법령정보센터 응답을 해석할 수 없습니다.") from exc
+    if not isinstance(payload, dict):
+        raise RuntimeError("법령정보센터 응답 형식이 올바르지 않습니다.")
+    # 인증 실패는 HTTP 200에 {"result": "...", "msg": "..."}로 온다.
+    if "result" in payload and len(payload) <= 3:
+        raise RuntimeError(
+            f"법령정보센터 호출이 거절됐습니다: {clean_text(str(payload.get('result')))}"
+            " (허용 IP·도메인 등록을 확인하세요)"
+        )
+    return payload
+
+
+def as_list(value: object) -> list[dict[str, object]]:
+    if isinstance(value, dict):
+        return [value]
+    if isinstance(value, list):
+        return [item for item in value if isinstance(item, dict)]
+    return []
+
+
+def parse_law_date(value: object) -> datetime | None:
+    digits = re.sub(r"\D", "", str(value or ""))
+    if len(digits) != 8:
+        return None
+    try:
+        return datetime.strptime(digits, "%Y%m%d").replace(tzinfo=KST).astimezone(timezone.utc)
+    except ValueError:
+        return None
+
+
+def law_article(summary: dict[str, object], detail: dict[str, object]) -> Article | None:
+    """판례 목록·본문 응답을 기사 형태로 바꾼다. 개인정보와 무관하면 버린다."""
+    seq = str(summary.get("판례일련번호") or "").strip()
+    case_number = clean_text(str(detail.get("사건번호") or summary.get("사건번호") or ""))
+    case_name = clean_text(str(detail.get("사건명") or summary.get("사건명") or ""))
+    court = clean_text(str(detail.get("법원명") or summary.get("법원명") or ""))
+    issue = clean_text(str(detail.get("판시사항") or ""))
+    gist = clean_text(str(detail.get("판결요지") or ""))
+    decided = parse_law_date(detail.get("선고일자") or summary.get("선고일자"))
+    if not seq or not case_number or decided is None:
+        return None
+    text = f"{case_name} {issue} {gist}"
+    if not any(term in text for term in PRECEDENT_TOPIC_TERMS):
+        return None
+    kind = clean_text(str(summary.get("판결유형") or "판결"))
+    date_text = decided.astimezone(KST).strftime("%Y.%m.%d.")
+    return Article(
+        title=f"{court} {date_text} 선고 {case_number} {kind} ({case_name})",
+        link=LAW_PUBLIC_URL.format(seq=seq),
+        source=f"{court} 판결문(법령정보센터)",
+        published=decided,
+        description=issue or gist,
+        keywords=("판례",),
+    )
+
+
+def fetch_law_precedents(api_key: str, timeout: float) -> list[Article]:
+    """법령정보센터에서 개인정보 관련 최신 판례를 판결문까지 읽어 온다."""
+    summaries: dict[str, dict[str, object]] = {}
+    for query in LAW_QUERIES:
+        payload = law_request(
+            "lawSearch",
+            {
+                "target": "prec", "search": "2", "query": query,
+                "display": str(LAW_LIST_SIZE), "sort": "ddes",
+            },
+            api_key,
+            timeout,
+        )
+        found = payload.get("PrecSearch")
+        entries = as_list(found.get("prec")) if isinstance(found, dict) else []
+        for entry in entries:
+            seq = str(entry.get("판례일련번호") or "")
+            if seq:
+                summaries.setdefault(seq, entry)
+    articles: list[Article] = []
+    for seq, summary in list(summaries.items())[:LAW_DETAIL_LIMIT]:
+        payload = law_request("lawService", {"target": "prec", "ID": seq}, api_key, timeout)
+        detail = payload.get("PrecService")
+        article = law_article(summary, detail if isinstance(detail, dict) else {})
+        if article:
+            articles.append(article)
+    print(f"[판례] 법령정보센터 판결문 {len(articles)}건")
+    return articles
+
+
+def collect_law_precedents(timeout: float) -> tuple[list[Article], str]:
+    """키가 있으면 판결문을 읽는다. 반환값은 (판례, 실패 사유). 키가 없으면 건너뛴다."""
+    api_key = get_law_api_key()
+    if not api_key:
+        print("[판례] LAW_API_KEY가 없어 판결문 조회를 건너뜁니다.", file=sys.stderr)
+        return [], ""
+    try:
+        return retry_operation(
+            "판결문 조회", lambda: fetch_law_precedents(api_key, timeout)
+        ), ""
+    except RuntimeError as exc:
+        print(f"[경고] 판결문 조회 실패: {exc}", file=sys.stderr)
+        return [], str(exc)
+
+
+def is_precedent_article(article: Article) -> bool:
+    """제목이 개인정보·보안 사건에 대한 법원 판단을 다루는지 판단한다."""
+    if is_user_generated(article):
+        return False
+    title = article.title.casefold()
+    return any(term in title for term in PRECEDENT_RULING_TERMS) and any(
+        term in title for term in PRECEDENT_TOPIC_TERMS
+    )
+
+
+def collect_precedents(
+    timeout: float, window_hours: int = PRECEDENT_WINDOW_HOURS
+) -> tuple[list[Article], int]:
+    """판례 전용 검색어로 기사를 모은다. 반환값은 (판례 기사, 실패한 검색어 수)."""
+    pool: list[Article] = []
+    failures = 0
+    for keyword in PRECEDENT_KEYWORDS:
+        print(f"[판례] {keyword}")
+        try:
+            pool.extend(
+                retry_operation(
+                    f"판례 수집({keyword})",
+                    lambda keyword=keyword: fetch_news(
+                        keyword, timeout=timeout, window_hours=window_hours
+                    ),
+                )
+            )
+        except RuntimeError as exc:
+            failures += 1
+            print(f"[경고] {keyword}: {exc}", file=sys.stderr)
+    return [article for article in pool if is_precedent_article(article)], failures
+
+
+def precedent_stories(
+    articles: Iterable[Article],
+    excluded_keys: set[str] | None = None,
+    now: datetime | None = None,
+    already_sent: bool = False,
+    window_hours: int = PRECEDENT_WINDOW_HOURS,
+) -> list[Story]:
+    """판례 기사를 같은 사건끼리 묶어 판례 구획의 Story로 만든다.
+
+    already_sent가 거짓이면 아직 안 보낸 기사만, 참이면 이미 보낸 기사만 쓴다.
+    """
+    unsent, sent = partition_recent_articles(
+        articles, window_hours=window_hours, excluded_keys=excluded_keys, now=now
+    )
+    chosen = sent if already_sent else unsent
+    return [
+        replace(story, preset_sections=(SECTION_CASELAW,))
+        for story in curate_heuristically(chosen, len(chosen))
+    ]
+
 
 # 개인정보가 외부로 나간 결과(개인정보보호법상 유출 신고 대상)를 가리키는 표현.
 LEAK_SIGNALS = ("유출", "노출")
@@ -1923,6 +2127,10 @@ def notice_lines(stats: RunStats) -> list[str]:
         lines.append(f"주제 {stats.failed_keywords}개는 수집에 실패했습니다.")
     if stats.failed_official:
         lines.append(f"공식 문서 게시판 {stats.failed_official}곳은 읽지 못했습니다.")
+    if stats.failed_precedents:
+        lines.append(f"판례 검색어 {stats.failed_precedents}개는 수집에 실패했습니다.")
+    if stats.law_error:
+        lines.append(f"판결문 직접 조회에 실패했습니다: {stats.law_error}")
     if stats.dropped_links:
         lines.append(
             f"링크가 제목과 다른 내용으로 연결되는 {stats.dropped_links}건은 뺐습니다."
@@ -2501,6 +2709,9 @@ def verify_story_links(
     """
     if story.preset_sections == (SECTION_OFFICIAL,):
         return story, LINK_OK
+    # 법령정보센터 판결문 링크는 원본이고 자바스크립트로 그려져 본문을 읽을 수 없다.
+    if (urlparse(story.representative.link).hostname or "").endswith("law.go.kr"):
+        return story, LINK_OK
     checked = story.articles[:LINK_MAX_TRIES]
     untouched = story.articles[LINK_MAX_TRIES:]
     verified: list[Article] = []
@@ -2555,6 +2766,22 @@ def order_revisited(official: list[Story], news: list[Story]) -> list[Story]:
     return sorted([*official, *news], key=story_heat, reverse=True)
 
 
+def require_github_actions() -> None:
+    """GitHub Actions 밖에서는 수집·전송을 하지 않는다.
+
+    뉴스·공식 문서·판례 조회와 Teams 전송은 모두 GitHub에서만 돌린다. 이 PC에서
+    호출이 새어 나가면 법령정보센터의 허용 IP와 어긋나고, 같은 기사가 두 번
+    전송되거나 전송 이력이 갈라진다.
+    """
+    if os.environ.get("GITHUB_ACTIONS") != "true":
+        print(
+            "오류: 수집과 전송은 GitHub Actions에서만 실행합니다. "
+            "리포의 Actions 탭에서 'Update News Report'를 실행하세요.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+
+
 def collect_candidates(
     keywords: list[str],
     timeout: float,
@@ -2591,6 +2818,7 @@ def build_report(
     verify_links: bool = True,
 ) -> Report:
     """후보를 모아 큐레이션한 구획과 처리 내역을 만든다."""
+    require_github_actions()
     pool, failures = collect_candidates(keywords, timeout, window_hours)
     candidates, seen = partition_recent_articles(
         pool, window_hours=window_hours, excluded_keys=excluded_keys or set()
@@ -2613,7 +2841,27 @@ def build_report(
     new_official = official_stories(official_pool, excluded_keys)
     official_sent = official_stories(official_pool, excluded_keys, already_sent=True)
     print(f"[공식 문서] 새 공식 문서 {len(new_official)}건")
-    stories = stories + new_official
+    precedent_pool, precedent_failures = collect_precedents(timeout)
+    law_pool, law_error = collect_law_precedents(timeout)
+    new_precedents = precedent_stories(precedent_pool, excluded_keys) + precedent_stories(
+        law_pool, excluded_keys, window_hours=LAW_WINDOW_HOURS
+    )
+    precedent_sent = precedent_stories(
+        precedent_pool, excluded_keys, already_sent=True
+    ) + precedent_stories(
+        law_pool, excluded_keys, already_sent=True, window_hours=LAW_WINDOW_HOURS
+    )
+    print(f"[판례] 새 판례 사건 {len(new_precedents)}건")
+    # 같은 기사가 일반 뉴스 구획과 판례 구획에 두 번 실리지 않도록 판례 쪽에 둔다.
+    precedent_keys = {
+        key for story in new_precedents for item in story.articles for key in article_keys(item)
+    }
+    stories = [
+        story
+        for story in stories
+        if not article_keys(story.representative) & precedent_keys
+    ]
+    stories = stories + new_official + new_precedents
     signals = load_feedback_signals(feedback_api_url, timeout)
     stories = apply_feedback(stories, signals)
     sections = group_sections(stories)
@@ -2635,7 +2883,7 @@ def build_report(
     clustered = curate_heuristically(seen, len(seen)) if seen else []
     # 이미 보낸 공식 문서도 시간 창 안이면 함께 적는다. 안 그러면 보낸 직후부터
     # 보고서의 공식 문서 구획이 비어 "올라온 문서가 없다"는 오해를 준다.
-    clustered = order_revisited(official_sent, clustered)
+    clustered = order_revisited(official_sent + precedent_sent, clustered)
     revisited = clustered[:REVISITED_LIMIT]
 
     stats = RunStats(
@@ -2649,6 +2897,8 @@ def build_report(
         failed_keywords=failures,
         official=len(new_official),
         failed_official=official_failures,
+        failed_precedents=precedent_failures,
+        law_error=law_error,
         dropped_links=dropped_links,
         unverified_links=unverified_links,
     )
